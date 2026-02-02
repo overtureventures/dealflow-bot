@@ -1,2 +1,4 @@
 slack-bolt==1.18.1
 requests==2.31.0
+schedule==1.2.1
+pytz==2024.1
