@@ -464,6 +464,15 @@ def handle_message(event, say, client):
         return
     
     channel_id = event.get("channel")
+    text = event.get("text", "").strip()
+    
+    # Check for manual nudge test command
+    if text.lower() == "!nudge-test":
+        say(text="🔄 Running nudge check...")
+        send_nudge_messages()
+        say(text="✅ Nudge check complete!")
+        return
+    
     try:
         channel_info = client.conversations_info(channel=channel_id)
         channel_name = channel_info["channel"]["name"]
@@ -474,7 +483,6 @@ def handle_message(event, say, client):
         logger.error(f"Error getting channel info: {e}")
         return
     
-    text = event.get("text", "").strip()
     if not text:
         return
     
