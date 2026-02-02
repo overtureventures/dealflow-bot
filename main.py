@@ -1,9 +1,14 @@
 import os
 import re
 import logging
+import threading
+from datetime import datetime, timedelta
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 import requests
+import schedule
+import time
+import pytz
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -12,6 +17,23 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
 AFFINITY_API_KEY = os.environ.get("AFFINITY_API_KEY")
 AFFINITY_LIST_ID = os.environ.get("AFFINITY_LIST_ID")
+NUDGE_CHANNEL_ID = os.environ.get("NUDGE_CHANNEL_ID")  # #deal-nudges channel ID
+
+# Owner name to Slack ID mapping
+OWNER_SLACK_MAP = {
+    "Emma McDonagh": "U02SC43GEH4",
+    "Shomik Dutta": "U03HP4WKP62",
+    "Allison Hinckley": "U07S6CLHPL1",
+    "Leila Pirbay": "U08840SFVN1",
+}
+
+# Stage nudge thresholds (in days)
+STAGE_THRESHOLDS = {
+    "First Meeting": 14,   # 2 weeks
+    "Engaged": 21,         # 3 weeks
+    "Need to Pass": 14,    # 2 weeks
+    "On Hold": 84,         # 12 weeks
+}
 
 app = App(token=SLACK_BOT_TOKEN)
 
@@ -87,6 +109,24 @@ class AffinityClient:
         """Get a specific organization by ID."""
         response = self.session.get(
             f"{AFFINITY_BASE_URL}/organizations/{org_id}"
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def get_field_value_changes(self, field_id):
+        """Get field value changes for tracking when stages changed."""
+        response = self.session.get(
+            f"{AFFINITY_BASE_URL}/field-value-changes",
+            params={"field_id": field_id}
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def get_list_entry_field_values(self, list_entry_id):
+        """Get field values for a specific list entry."""
+        response = self.session.get(
+            f"{AFFINITY_BASE_URL}/field-values",
+            params={"list_entry_id": list_entry_id}
         )
         response.raise_for_status()
         return response.json()
@@ -259,6 +299,164 @@ def process_company(search_term, domain=None):
         }
 
 
+def get_deals_needing_nudge():
+    """Get all deals that have been in a stage longer than the threshold."""
+    try:
+        # Get list fields to find Status and Owners fields
+        fields = affinity.get_list_fields(AFFINITY_LIST_ID)
+        status_field_id = None
+        owners_field_id = None
+        status_options = {}
+        
+        for field in fields:
+            field_name = field.get("name", "").lower()
+            if field_name in ["status", "stage"]:
+                status_field_id = field.get("id")
+                for option in field.get("dropdown_options", []):
+                    status_options[option["id"]] = option["text"]
+            elif field_name == "owners":
+                owners_field_id = field.get("id")
+        
+        if not status_field_id:
+            logger.error("Could not find Status field")
+            return []
+        
+        # Get all list entries
+        list_entries = affinity.get_list_entries(AFFINITY_LIST_ID)
+        
+        deals_to_nudge = []
+        now = datetime.now(pytz.UTC)
+        
+        for entry in list_entries:
+            entity_id = entry.get("entity_id")
+            list_entry_id = entry.get("id")
+            created_at = entry.get("created_at")
+            
+            # Get field values for this entry
+            field_values = affinity.get_list_entry_field_values(list_entry_id)
+            
+            current_status = None
+            status_updated_at = None
+            owners = []
+            
+            for fv in field_values:
+                if fv.get("field_id") == status_field_id:
+                    value = fv.get("value")
+                    if isinstance(value, dict) and "text" in value:
+                        current_status = value["text"]
+                    elif isinstance(value, int) and value in status_options:
+                        current_status = status_options[value]
+                    status_updated_at = fv.get("updated_at") or fv.get("created_at")
+                
+                elif fv.get("field_id") == owners_field_id:
+                    # Owner field value is a person ID, need to resolve name
+                    owner_value = fv.get("value")
+                    if owner_value:
+                        owners.append(owner_value)
+            
+            # Check if this status needs a nudge
+            if current_status and current_status in STAGE_THRESHOLDS:
+                threshold_days = STAGE_THRESHOLDS[current_status]
+                
+                # Parse the date when status was set
+                if status_updated_at:
+                    try:
+                        status_date = datetime.fromisoformat(status_updated_at.replace('Z', '+00:00'))
+                    except:
+                        status_date = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                else:
+                    status_date = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                
+                days_in_stage = (now - status_date).days
+                
+                if days_in_stage >= threshold_days:
+                    # Get org details
+                    try:
+                        org = affinity.get_organization(entity_id)
+                        org_name = org.get("name", "Unknown")
+                        
+                        weeks_in_stage = days_in_stage // 7
+                        week_text = f"{weeks_in_stage} week" + ("s" if weeks_in_stage != 1 else "")
+                        
+                        deals_to_nudge.append({
+                            "org_id": entity_id,
+                            "org_name": org_name,
+                            "status": current_status,
+                            "days_in_stage": days_in_stage,
+                            "week_text": week_text,
+                            "owners": owners,
+                            "link": f"https://overture.affinity.co/companies/{entity_id}"
+                        })
+                    except Exception as e:
+                        logger.error(f"Error getting org {entity_id}: {e}")
+        
+        return deals_to_nudge
+        
+    except Exception as e:
+        logger.error(f"Error getting deals needing nudge: {e}")
+        return []
+
+
+def get_owner_name_from_id(person_id):
+    """Get person name from Affinity person ID."""
+    try:
+        response = affinity.session.get(f"{AFFINITY_BASE_URL}/persons/{person_id}")
+        response.raise_for_status()
+        person = response.json()
+        first_name = person.get("first_name", "")
+        last_name = person.get("last_name", "")
+        return f"{first_name} {last_name}".strip()
+    except:
+        return None
+
+
+def send_nudge_messages():
+    """Check for deals needing nudges and send Slack messages."""
+    logger.info("Running nudge check...")
+    
+    if not NUDGE_CHANNEL_ID:
+        logger.error("NUDGE_CHANNEL_ID not set")
+        return
+    
+    deals = get_deals_needing_nudge()
+    logger.info(f"Found {len(deals)} deals needing nudges")
+    
+    for deal in deals:
+        # Determine who to tag
+        slack_mention = ""
+        
+        if deal["owners"]:
+            # Get first owner's name and map to Slack ID
+            owner_name = get_owner_name_from_id(deal["owners"][0])
+            if owner_name and owner_name in OWNER_SLACK_MAP:
+                slack_id = OWNER_SLACK_MAP[owner_name]
+                slack_mention = f"<@{slack_id}> "
+        
+        message = f"{slack_mention}{deal['org_name']} has been in \"{deal['status']}\" for {deal['week_text']}. Link: {deal['link']}"
+        
+        try:
+            app.client.chat_postMessage(
+                channel=NUDGE_CHANNEL_ID,
+                text=message
+            )
+            logger.info(f"Sent nudge for {deal['org_name']}")
+        except Exception as e:
+            logger.error(f"Error sending nudge for {deal['org_name']}: {e}")
+
+
+def run_scheduler():
+    """Run the scheduler in a separate thread."""
+    # Schedule nudge check at 9am PT daily
+    pacific = pytz.timezone('America/Los_Angeles')
+    schedule.every().day.at("09:00").do(send_nudge_messages)
+    
+    logger.info("Scheduler started - nudges will run daily at 9am PT")
+    
+    while True:
+        schedule.run_pending()
+        time.sleep(60)  # Check every minute
+
+
 @app.event("message")
 def handle_message(event, say, client):
     """Handle messages posted to #dealflow channel."""
@@ -302,6 +500,10 @@ def handle_mention(event, say):
 
 
 if __name__ == "__main__":
+    # Start scheduler in background thread
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+    
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
-    logger.info("Starting Slack bot...")
+    logger.info("Starting Slack bot with nudge scheduler...")
     handler.start()
