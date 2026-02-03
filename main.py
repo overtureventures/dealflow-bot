@@ -448,9 +448,9 @@ def run_scheduler():
     """Run the scheduler in a separate thread."""
     # Schedule nudge check at 9am PT daily
     pacific = pytz.timezone('America/Los_Angeles')
-    schedule.every().day.at("09:00").do(send_nudge_messages)
+    schedule.every().tuesday.at("09:00").do(send_nudge_messages)
     
-    logger.info("Scheduler started - nudges will run daily at 9am PT")
+    logger.info("Scheduler started - nudges will run Tuesdays at 9am PT")
     
     while True:
         schedule.run_pending()
