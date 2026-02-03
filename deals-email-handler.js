@@ -23,44 +23,43 @@ const openai = new OpenAI({
 const AFFINITY_API_KEY = process.env.AFFINITY_API_KEY;
 const AFFINITY_BASE_URL = 'https://api.affinity.co';
 
-// Affinity Field IDs - UPDATE THESE with your actual field IDs
+// Affinity Field IDs
 const AFFINITY_CONFIG = {
   DEAL_LIST_ID: process.env.AFFINITY_DEAL_LIST_ID,
   SOURCE_FIELD_ID: process.env.AFFINITY_SOURCE_FIELD_ID,
   SOURCE_NOTE_FIELD_ID: process.env.AFFINITY_SOURCE_NOTE_FIELD_ID,
-  // Value ID for "inbound" in the Source dropdown (if it's a dropdown field)
   SOURCE_INBOUND_VALUE_ID: process.env.AFFINITY_SOURCE_INBOUND_VALUE_ID,
 };
 
 // Gmail configuration
-const GMAIL_LABEL = 'INBOX'; // Or create a specific label
 const PROCESSED_LABEL = 'Processed-Deals';
+const DEALS_ALIAS = 'deals@overture.eco';
 
 /**
- * Initialize Gmail API client
+ * Initialize Gmail API client using OAuth
  */
 async function getGmailClient() {
-  const auth = new google.auth.GoogleAuth({
-    credentials: {
-      client_email: process.env.GMAIL_CLIENT_EMAIL,
-      private_key: process.env.GMAIL_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-    },
-    scopes: ['https://www.googleapis.com/auth/gmail.modify'],
-    subject: 'deals@overture.eco', // The email to impersonate
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GMAIL_CLIENT_ID,
+    process.env.GMAIL_CLIENT_SECRET
+  );
+
+  oauth2Client.setCredentials({
+    refresh_token: process.env.GMAIL_REFRESH_TOKEN,
   });
 
-  return google.gmail({ version: 'v1', auth });
+  return google.gmail({ version: 'v1', auth: oauth2Client });
 }
 
 /**
- * Fetch unprocessed emails from deals@overture.eco
+ * Fetch unprocessed emails sent to deals@overture.eco
  */
 async function fetchNewEmails(gmail) {
   try {
-    // Search for unread emails or emails without the processed label
+    // Search for unread emails sent to deals@ alias
     const response = await gmail.users.messages.list({
       userId: 'me',
-      q: 'is:unread -label:' + PROCESSED_LABEL,
+      q: `to:${DEALS_ALIAS} is:unread -label:${PROCESSED_LABEL}`,
       maxResults: 50,
     });
 
@@ -91,9 +90,9 @@ async function fetchNewEmails(gmail) {
  */
 function parseEmailContent(email) {
   const headers = email.payload.headers;
-  const subject = headers.find(h => h.name === 'Subject')?.value || '';
-  const from = headers.find(h => h.name === 'From')?.value || '';
-  const date = headers.find(h => h.name === 'Date')?.value || '';
+  const subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value || '';
+  const from = headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
+  const date = headers.find(h => h.name.toLowerCase() === 'date')?.value || '';
 
   // Extract body
   let body = '';
@@ -147,14 +146,14 @@ Respond ONLY with valid JSON, no markdown or explanation.`;
   } catch (error) {
     console.error('Error extracting company info:', error);
     // Fallback: try to extract domain from sender email
-    const emailMatch = emailContent.from.match(/<(.+@(.+))>/);
+    const emailMatch = emailContent.from.match(/<(.+@(.+))>/) || emailContent.from.match(/(.+@(.+))/);
     if (emailMatch) {
       return {
         company_url: null,
         company_name: emailMatch[2].split('.')[0],
         company_domain: emailMatch[2],
         sender_email: emailMatch[1],
-        sender_name: emailContent.from.split('<')[0].trim(),
+        sender_name: emailContent.from.split('<')[0].trim() || emailMatch[1],
         brief_description: 'Extracted from email sender',
       };
     }
@@ -239,9 +238,31 @@ async function createAffinityOrganization(companyInfo) {
 }
 
 /**
+ * Check if organization is already in the deal pipeline
+ */
+async function isOrgInDealPipeline(organizationId) {
+  try {
+    const listEntries = await affinityRequest(
+      `/list-entries?list_id=${AFFINITY_CONFIG.DEAL_LIST_ID}&entity_id=${organizationId}`
+    );
+    return listEntries.list_entries?.length > 0;
+  } catch (error) {
+    console.log('Error checking list entries:', error.message);
+    return false;
+  }
+}
+
+/**
  * Add organization to deal pipeline list
  */
 async function addToDealPipeline(organizationId) {
+  // Check if already in pipeline
+  const alreadyInPipeline = await isOrgInDealPipeline(organizationId);
+  if (alreadyInPipeline) {
+    console.log(`Organization ${organizationId} already in deal pipeline, skipping`);
+    return null;
+  }
+
   const listEntryData = {
     list_id: parseInt(AFFINITY_CONFIG.DEAL_LIST_ID),
     entity_id: organizationId,
@@ -259,23 +280,13 @@ async function addToDealPipeline(organizationId) {
 async function setListEntryFields(listEntryId, companyInfo) {
   const fieldValues = [];
 
-  // Set Source field to "inbound"
-  if (AFFINITY_CONFIG.SOURCE_FIELD_ID) {
-    // If it's a dropdown field, use the value_id
-    if (AFFINITY_CONFIG.SOURCE_INBOUND_VALUE_ID) {
-      fieldValues.push({
-        field_id: parseInt(AFFINITY_CONFIG.SOURCE_FIELD_ID),
-        list_entry_id: listEntryId,
-        value: parseInt(AFFINITY_CONFIG.SOURCE_INBOUND_VALUE_ID),
-      });
-    } else {
-      // If it's a text field
-      fieldValues.push({
-        field_id: parseInt(AFFINITY_CONFIG.SOURCE_FIELD_ID),
-        list_entry_id: listEntryId,
-        value: 'inbound',
-      });
-    }
+  // Set Source field to "inbound" (dropdown)
+  if (AFFINITY_CONFIG.SOURCE_FIELD_ID && AFFINITY_CONFIG.SOURCE_INBOUND_VALUE_ID) {
+    fieldValues.push({
+      field_id: parseInt(AFFINITY_CONFIG.SOURCE_FIELD_ID),
+      list_entry_id: listEntryId,
+      value: parseInt(AFFINITY_CONFIG.SOURCE_INBOUND_VALUE_ID),
+    });
   }
 
   // Set Source Note field to "deals@"
@@ -347,6 +358,7 @@ async function processEmail(gmail, email) {
 
     if (!companyInfo.company_name && !companyInfo.company_domain) {
       console.log('Could not extract company information, skipping');
+      await markEmailProcessed(gmail, emailContent.messageId);
       return { success: false, reason: 'No company info extracted' };
     }
 
@@ -361,8 +373,10 @@ async function processEmail(gmail, email) {
     // Step 4: Add to deal pipeline
     const listEntry = await addToDealPipeline(organization.id);
 
-    // Step 5: Set Source and Source Note fields
-    await setListEntryFields(listEntry.id, companyInfo);
+    // Step 5: Set Source and Source Note fields (only if newly added)
+    if (listEntry) {
+      await setListEntryFields(listEntry.id, companyInfo);
+    }
 
     // Step 6: Mark email as processed
     await markEmailProcessed(gmail, emailContent.messageId);
@@ -372,7 +386,8 @@ async function processEmail(gmail, email) {
       success: true,
       company: companyInfo.company_name,
       organizationId: organization.id,
-      listEntryId: listEntry.id,
+      listEntryId: listEntry?.id,
+      alreadyInPipeline: !listEntry,
     };
   } catch (error) {
     console.error(`Error processing email "${emailContent.subject}":`, error);
@@ -395,13 +410,18 @@ async function processDealsEmails() {
   const results = {
     processed: 0,
     failed: 0,
+    skipped: 0,
     details: [],
   };
 
   for (const email of emails) {
     const result = await processEmail(gmail, email);
     if (result.success) {
-      results.processed++;
+      if (result.alreadyInPipeline) {
+        results.skipped++;
+      } else {
+        results.processed++;
+      }
     } else {
       results.failed++;
     }
@@ -411,7 +431,7 @@ async function processDealsEmails() {
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
 
-  console.log(`\nProcessing complete: ${results.processed} succeeded, ${results.failed} failed`);
+  console.log(`\nProcessing complete: ${results.processed} added, ${results.skipped} skipped, ${results.failed} failed`);
   return results;
 }
 
