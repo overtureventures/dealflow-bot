@@ -486,13 +486,18 @@ def handle_message(event, say, client):
     if not text:
         return
     
+    # Only process messages that contain a URL
+    url_pattern = r'https?://[^\s]+'
+    if not re.search(url_pattern, text):
+        return
+    
     logger.info(f"Processing message: {text}")
     company_name, domain = extract_company_info(text)
     logger.info(f"Extracted - Name: {company_name}, Domain: {domain}")
     
     if not company_name and not domain:
         return
-    
+        
     result = process_company(company_name, domain)
     
     say(text=result["message"])
