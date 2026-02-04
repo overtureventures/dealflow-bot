@@ -35,6 +35,10 @@ STAGE_THRESHOLDS = {
     "On Hold": 84,         # 12 weeks
 }
 
+# Affinity Status field ID and Missed status value ID
+STATUS_FIELD_ID = 4927710
+MISSED_STATUS_VALUE_ID = 20689035
+
 app = App(token=SLACK_BOT_TOKEN)
 
 AFFINITY_BASE_URL = "https://api.affinity.co"
@@ -131,6 +135,21 @@ class AffinityClient:
         response.raise_for_status()
         return response.json()
 
+    def set_field_value(self, field_id, list_entry_id, value):
+        """Set a field value for a list entry."""
+        logger.info(f"Setting field {field_id} to {value} for list entry {list_entry_id}")
+        response = self.session.post(
+            f"{AFFINITY_BASE_URL}/field-values",
+            json={
+                "field_id": field_id,
+                "entity_id": list_entry_id,
+                "list_entry_id": list_entry_id,
+                "value": value
+            }
+        )
+        response.raise_for_status()
+        return response.json()
+
 
 affinity = AffinityClient(AFFINITY_API_KEY)
 
@@ -219,7 +238,7 @@ def check_org_in_list(organization_id, list_id):
         return False, None
 
 
-def process_company(search_term, domain=None):
+def process_company(search_term, domain=None, is_missed=False):
     """Check if company exists in deal pipeline. If yes, return current stage. If no, add it."""
     try:
         # Search using domain if available, otherwise use name
@@ -263,7 +282,20 @@ def process_company(search_term, domain=None):
                 }
             else:
                 # Org exists but not in pipeline - add it
-                affinity.add_to_list(AFFINITY_LIST_ID, org_id)
+                list_entry = affinity.add_to_list(AFFINITY_LIST_ID, org_id)
+                
+                # If marked as missed, set the status
+                if is_missed:
+                    try:
+                        affinity.set_field_value(STATUS_FIELD_ID, list_entry["id"], MISSED_STATUS_VALUE_ID)
+                        return {
+                            "status": "added",
+                            "company": org_name,
+                            "message": f"😢 Added *{org_name}* to the deal pipeline as *Missed*."
+                        }
+                    except Exception as e:
+                        logger.error(f"Error setting missed status: {e}")
+                
                 return {
                     "status": "added",
                     "company": org_name,
@@ -277,7 +309,20 @@ def process_company(search_term, domain=None):
             org_name = new_org["name"]
             logger.info(f"Created organization: {org_name} (ID: {org_id})")
             
-            affinity.add_to_list(AFFINITY_LIST_ID, org_id)
+            list_entry = affinity.add_to_list(AFFINITY_LIST_ID, org_id)
+            
+            # If marked as missed, set the status
+            if is_missed:
+                try:
+                    affinity.set_field_value(STATUS_FIELD_ID, list_entry["id"], MISSED_STATUS_VALUE_ID)
+                    return {
+                        "status": "created",
+                        "company": org_name,
+                        "message": f"😢 Created *{org_name}* and added to the deal pipeline as *Missed*."
+                    }
+                except Exception as e:
+                    logger.error(f"Error setting missed status: {e}")
+            
             return {
                 "status": "created",
                 "company": org_name,
@@ -446,7 +491,7 @@ def send_nudge_messages():
 
 def run_scheduler():
     """Run the scheduler in a separate thread."""
-    # Schedule nudge check at 9am PT daily
+    # Schedule nudge check at 9am PT on Tuesdays
     pacific = pytz.timezone('America/Los_Angeles')
     schedule.every().tuesday.at("09:00").do(send_nudge_messages)
     
@@ -497,9 +542,14 @@ def handle_message(event, say, client):
     
     if not company_name and not domain:
         return
-        
-user_id = event.get("user")
-    result = process_company(company_name, domain)
+    
+    user_id = event.get("user")
+    
+    # Check if this is a "missed" deal
+    missed_pattern = r'\b(missed|miss|missing)\b'
+    is_missed = bool(re.search(missed_pattern, text.lower()))
+    
+    result = process_company(company_name, domain, is_missed=is_missed)
     
     say(text=f"<@{user_id}> {result['message']}")
 
