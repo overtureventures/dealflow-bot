@@ -135,13 +135,14 @@ class AffinityClient:
         response.raise_for_status()
         return response.json()
 
-    def set_field_value(self, field_id, list_entry_id, value):
+    def set_field_value(self, field_id, entity_id, list_entry_id, value):
         """Set a field value for a list entry."""
-        logger.info(f"Setting field {field_id} to {value} for list entry {list_entry_id}")
+        logger.info(f"Setting field {field_id} to {value} for entity {entity_id}, list entry {list_entry_id}")
         response = self.session.post(
             f"{AFFINITY_BASE_URL}/field-values",
             json={
                 "field_id": field_id,
+                "entity_id": entity_id,
                 "list_entry_id": list_entry_id,
                 "value": value
             }
@@ -288,7 +289,7 @@ def process_company(search_term, domain=None, is_missed=False):
                 # If marked as missed, set the status
                 if is_missed:
                     try:
-                        affinity.set_field_value(STATUS_FIELD_ID, list_entry["id"], MISSED_STATUS_VALUE_ID)
+                        affinity.set_field_value(STATUS_FIELD_ID, org_id, list_entry["id"], MISSED_STATUS_VALUE_ID)
                         return {
                             "status": "added",
                             "company": org_name,
@@ -315,7 +316,7 @@ def process_company(search_term, domain=None, is_missed=False):
             # If marked as missed, set the status
             if is_missed:
                 try:
-                    affinity.set_field_value(STATUS_FIELD_ID, list_entry["id"], MISSED_STATUS_VALUE_ID)
+                    affinity.set_field_value(STATUS_FIELD_ID, org_id, list_entry["id"], MISSED_STATUS_VALUE_ID)
                     return {
                         "status": "created",
                         "company": org_name,
