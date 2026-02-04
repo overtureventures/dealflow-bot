@@ -498,9 +498,10 @@ def handle_message(event, say, client):
     if not company_name and not domain:
         return
         
+user_id = event.get("user")
     result = process_company(company_name, domain)
     
-    say(text=result["message"])
+    say(text=f"<@{user_id}> {result['message']}")
 
 
 @app.event("app_mention")
