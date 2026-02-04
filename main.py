@@ -173,6 +173,8 @@ def extract_company_info(text):
     company_name = text.strip()
     company_name = re.sub(r'https?://(?:www\.)?', '', company_name)
     company_name = re.sub(r'\([^)]*\)', '', company_name)
+    # Remove missed/miss/missing keywords
+    company_name = re.sub(r'\b(missed|miss|missing|we|this|one|was|a)\b', '', company_name, flags=re.IGNORECASE)
     company_name = company_name.strip(' -–—:/')
     
     # If we have a domain, use it as the search term
@@ -536,7 +538,11 @@ def handle_message(event, say, client):
     if not re.search(url_pattern, text):
         return
     
-    logger.info(f"Processing message: {text}")
+    # Check if this is a "missed" deal BEFORE extracting company info
+    missed_pattern = r'\b(missed|miss|missing)\b'
+    is_missed = bool(re.search(missed_pattern, text.lower()))
+    logger.info(f"Processing message: {text} (is_missed: {is_missed})")
+    
     company_name, domain = extract_company_info(text)
     logger.info(f"Extracted - Name: {company_name}, Domain: {domain}")
     
@@ -544,10 +550,6 @@ def handle_message(event, say, client):
         return
     
     user_id = event.get("user")
-    
-    # Check if this is a "missed" deal
-    missed_pattern = r'\b(missed|miss|missing)\b'
-    is_missed = bool(re.search(missed_pattern, text.lower()))
     
     result = process_company(company_name, domain, is_missed=is_missed)
     
