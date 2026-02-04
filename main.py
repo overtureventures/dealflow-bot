@@ -142,7 +142,6 @@ class AffinityClient:
             f"{AFFINITY_BASE_URL}/field-values",
             json={
                 "field_id": field_id,
-                "entity_id": list_entry_id,
                 "list_entry_id": list_entry_id,
                 "value": value
             }
