@@ -27,6 +27,14 @@ OWNER_SLACK_MAP = {
     "Leila Pirbay": "U08840SFVN1",
 }
 
+# Slack ID to Affinity Person ID mapping
+SLACK_TO_AFFINITY_PERSON = {
+    "U02SC43GEH4": 217635093,   # Emma McDonagh
+    "U03HP4WKP62": 217635937,   # Shomik Dutta
+    "U07S6CLHPL1": 217637423,   # Allison Hinckley
+    "U08840SFVN1": 217635950,   # Leila Pirbay
+}
+
 # Stage nudge thresholds (in days)
 STAGE_THRESHOLDS = {
     "First Meeting": 14,   # 2 weeks
@@ -35,8 +43,10 @@ STAGE_THRESHOLDS = {
     "On Hold": 84,         # 12 weeks
 }
 
-# Affinity Status field ID and Missed status value ID
+# Affinity field IDs
 STATUS_FIELD_ID = 4927710
+OWNERS_FIELD_ID = 4927712
+PASS_REASON_FIELD_ID = 4944316
 MISSED_STATUS_VALUE_ID = 20689035
 
 app = App(token=SLACK_BOT_TOKEN)
@@ -138,15 +148,19 @@ class AffinityClient:
     def set_field_value(self, field_id, entity_id, list_entry_id, value):
         """Set a field value for a list entry."""
         logger.info(f"Setting field {field_id} to {value} for entity {entity_id}, list entry {list_entry_id}")
+        payload = {
+            "field_id": field_id,
+            "entity_id": entity_id,
+            "list_entry_id": list_entry_id,
+            "value": value
+        }
+        logger.info(f"Payload: {payload}")
         response = self.session.post(
             f"{AFFINITY_BASE_URL}/field-values",
-            json={
-                "field_id": field_id,
-                "entity_id": entity_id,
-                "list_entry_id": list_entry_id,
-                "value": value
-            }
+            json=payload
         )
+        if not response.ok:
+            logger.error(f"Affinity error response: {response.text}")
         response.raise_for_status()
         return response.json()
 
@@ -240,7 +254,46 @@ def check_org_in_list(organization_id, list_id):
         return False, None
 
 
-def process_company(search_term, domain=None, is_missed=False):
+def get_list_entry_details(org_id, list_id):
+    """Get owner names and pass reason for an org in a list."""
+    try:
+        org = affinity.get_organization(org_id)
+        list_entries = org.get("list_entries", [])
+        
+        for entry in list_entries:
+            if entry.get("list_id") == int(list_id):
+                list_entry_id = entry.get("id")
+                field_values = affinity.get_list_entry_field_values(list_entry_id)
+                
+                owners = []
+                pass_reasons = []
+                
+                for fv in field_values:
+                    # Get owners
+                    if fv.get("field_id") == OWNERS_FIELD_ID:
+                        person_id = fv.get("value")
+                        if person_id:
+                            owner_name = get_owner_name_from_id(person_id)
+                            if owner_name:
+                                owners.append(owner_name)
+                    
+                    # Get pass reason
+                    if fv.get("field_id") == PASS_REASON_FIELD_ID:
+                        value = fv.get("value")
+                        if isinstance(value, dict) and "text" in value:
+                            pass_reasons.append(value["text"])
+                        elif value:
+                            pass_reasons.append(str(value))
+                
+                return owners, pass_reasons
+        
+        return [], []
+    except Exception as e:
+        logger.error(f"Error getting list entry details: {e}")
+        return [], []
+
+
+def process_company(search_term, domain=None, is_missed=False, slack_user_id=None):
     """Check if company exists in deal pipeline. If yes, return current stage. If no, add it."""
     try:
         # Search using domain if available, otherwise use name
@@ -274,17 +327,36 @@ def process_company(search_term, domain=None, is_missed=False):
             in_list, entry = check_org_in_list(org_id, AFFINITY_LIST_ID)
             
             if in_list:
-                # Already in pipeline - get current stage
+                # Already in pipeline - get current stage, owner, and pass reason
                 stage = get_stage_name(org_id, AFFINITY_LIST_ID)
+                owners, pass_reasons = get_list_entry_details(org_id, AFFINITY_LIST_ID)
+                
+                message = f"*{org_name}* is already in the deal pipeline.\n📊 Current stage: *{stage}*"
+                
+                if owners:
+                    message += f"\n👤 Owner: {', '.join(owners)}"
+                
+                if stage == "Passed" and pass_reasons:
+                    message += f"\n❌ Pass reason: {', '.join(pass_reasons)}"
+                
                 return {
                     "status": "exists",
                     "company": org_name,
                     "stage": stage,
-                    "message": f"*{org_name}* is already in the deal pipeline.\n📊 Current stage: *{stage}*"
+                    "message": message
                 }
             else:
                 # Org exists but not in pipeline - add it
                 list_entry = affinity.add_to_list(AFFINITY_LIST_ID, org_id)
+                
+                # Set owner if we have a slack user mapping
+                if slack_user_id and slack_user_id in SLACK_TO_AFFINITY_PERSON:
+                    try:
+                        affinity_person_id = SLACK_TO_AFFINITY_PERSON[slack_user_id]
+                        affinity.set_field_value(OWNERS_FIELD_ID, org_id, list_entry["id"], affinity_person_id)
+                        logger.info(f"Set owner to person {affinity_person_id}")
+                    except Exception as e:
+                        logger.error(f"Error setting owner: {e}")
                 
                 # If marked as missed, set the status
                 if is_missed:
@@ -312,6 +384,15 @@ def process_company(search_term, domain=None, is_missed=False):
             logger.info(f"Created organization: {org_name} (ID: {org_id})")
             
             list_entry = affinity.add_to_list(AFFINITY_LIST_ID, org_id)
+            
+            # Set owner if we have a slack user mapping
+            if slack_user_id and slack_user_id in SLACK_TO_AFFINITY_PERSON:
+                try:
+                    affinity_person_id = SLACK_TO_AFFINITY_PERSON[slack_user_id]
+                    affinity.set_field_value(OWNERS_FIELD_ID, org_id, list_entry["id"], affinity_person_id)
+                    logger.info(f"Set owner to person {affinity_person_id}")
+                except Exception as e:
+                    logger.error(f"Error setting owner: {e}")
             
             # If marked as missed, set the status
             if is_missed:
@@ -551,7 +632,7 @@ def handle_message(event, say, client):
     
     user_id = event.get("user")
     
-    result = process_company(company_name, domain, is_missed=is_missed)
+    result = process_company(company_name, domain, is_missed=is_missed, slack_user_id=user_id)
     
     say(text=f"<@{user_id}> {result['message']}")
 
