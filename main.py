@@ -133,6 +133,19 @@ EXCLUDED_DOMAINS = {
     "bing.com", "google.com", "duckduckgo.com", "brave.com",
     # App stores
     "apps.apple.com", "play.google.com",
+    # Retail / marketplaces (common culprits for ambiguous single-word queries)
+    "amazon.com", "amazon.co.uk", "etsy.com", "ebay.com", "walmart.com",
+    "homedepot.com", "lowes.com", "target.com", "wayfair.com", "alibaba.com",
+    "aliexpress.com", "shopify.com", "pinterest.com",
+}
+
+# Page-body keywords that mark a candidate as retail/product/non-company-homepage.
+# If a candidate's body has many of these AND zero Overture-sector hits, drop it.
+RETAIL_KEYWORDS = {
+    "add to cart", "add to bag", "buy now", "shop now", "free shipping",
+    "in stock", "out of stock", "shipping & returns", "add to wishlist",
+    "product details", "product description", "quantity", "sku:",
+    "customer reviews", "star rating", "checkout", "delivery to",
 }
 
 # Minimum characters in a no-URL message before we trigger the URL-search poll
@@ -453,7 +466,9 @@ def strip_linkedin_urls(text):
 
 
 def process_linkedin_person(linkedin_info, poster_id, client, channel_id, thread_ts):
-    """Add a LinkedIn /in/ person as a Person lead in Affinity."""
+    """Post a confirmation poll so the poster can verify the parsed name
+    before we create an Affinity Person record. Posts in-channel (not threaded).
+    """
     first = linkedin_info.get("first_name", "")
     last = linkedin_info.get("last_name", "")
     name = linkedin_info.get("name", "").strip()
@@ -462,18 +477,81 @@ def process_linkedin_person(linkedin_info, poster_id, client, channel_id, thread
     if not name:
         client.chat_postMessage(
             channel=channel_id,
-            thread_ts=thread_ts,
             text=(
                 f"<@{poster_id}> I couldn't parse a name from that LinkedIn URL. "
-                f"Please share the person's name and I'll add them as a lead."
+                f"Please share the person's name and I'll add them as a lead.\n"
+                f"🔗 {url}"
             ),
             unfurl_links=False,
             unfurl_media=False,
         )
         return
 
+    # Build confirmation poll with Confirm / Edit / Skip buttons
+    payload = json.dumps({
+        "first": first,
+        "last": last,
+        "name": name,
+        "url": url,
+        "poster_id": poster_id,
+    })[:1900]
+
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"<@{poster_id}> shared a LinkedIn profile. "
+                    f"I parsed the name as *{name}*. Is this right?\n"
+                    f"🔗 <{url}|{url}>"
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Confirm & add", "emoji": True},
+                    "action_id": "linkedin_person_confirm",
+                    "value": payload,
+                    "style": "primary",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✏️ Edit name", "emoji": True},
+                    "action_id": "linkedin_person_edit",
+                    "value": payload,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "⏭️ Skip", "emoji": True},
+                    "action_id": "linkedin_person_skip",
+                    "value": payload,
+                },
+            ],
+        },
+    ]
+
+    client.chat_postMessage(
+        channel=channel_id,
+        text=f"Confirm person: {name}",
+        blocks=blocks,
+        unfurl_links=False,
+        unfurl_media=False,
+    )
+
+
+def _create_affinity_person_and_notify(first, last, url, poster_id, clicker_id, channel_id, client, message_ts=None):
+    """Shared helper: create/find the Affinity Person, attach LinkedIn note,
+    and post (or update) the resolution message in the channel.
+
+    Called from the linkedin_person_confirm button handler and from the
+    linkedin-edit modal submission.
+    """
+    name = f"{first} {last}".strip() or first or last or "Unknown"
     try:
-        # Check if person already exists
         existing = affinity.search_person(name)
         match = None
         for p in existing:
@@ -485,67 +563,56 @@ def process_linkedin_person(linkedin_info, poster_id, client, channel_id, thread
 
         if match:
             person_id = match["id"]
-            # Still attach a note if the LinkedIn URL isn't already recorded
             try:
                 affinity.create_person_note(
                     person_id,
-                    f"LinkedIn: {url} (shared by <@{poster_id}> via dealflow-bot)",
+                    f"LinkedIn: {url} (shared by <@{poster_id}>, confirmed by <@{clicker_id}> via dealflow-bot)",
                 )
             except Exception as e:
                 logger.warning(f"Could not add note to existing person: {e}")
+            resolved = (
+                f"<@{clicker_id}> confirmed *{name}* — already in Affinity as a person. "
+                f"LinkedIn URL added as a note.\n🔗 {url}"
+            )
+        else:
+            person = affinity.create_person(first_name=first, last_name=last or "")
+            person_id = person.get("id")
+            try:
+                affinity.create_person_note(
+                    person_id,
+                    f"LinkedIn: {url} (shared by <@{poster_id}>, confirmed by <@{clicker_id}> via dealflow-bot)",
+                )
+            except Exception as e:
+                logger.warning(f"Could not add note to new person: {e}")
+            resolved = (
+                f"✅ <@{clicker_id}> added *{name}* as a person lead in Affinity for <@{poster_id}>'s post. "
+                f"LinkedIn saved as a note.\n🔗 {url}"
+            )
+
+        if message_ts:
+            disable_poll_message(client, channel_id, message_ts, resolved)
+        else:
             client.chat_postMessage(
                 channel=channel_id,
-                thread_ts=thread_ts,
-                text=(
-                    f"<@{poster_id}> *{name}* is already in Affinity as a person. "
-                    f"I added the LinkedIn URL as a note.\n"
-                    f"🔗 {url}"
-                ),
+                text=resolved,
                 unfurl_links=False,
                 unfurl_media=False,
             )
-            return
-
-        # Create new person
-        person = affinity.create_person(first_name=first, last_name=last or "")
-        person_id = person.get("id")
-        try:
-            affinity.create_person_note(
-                person_id,
-                f"LinkedIn: {url} (shared by <@{poster_id}> via dealflow-bot)",
-            )
-        except Exception as e:
-            logger.warning(f"Could not add note to new person: {e}")
-
-        client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text=(
-                f"<@{poster_id}> ✅ Added *{name}* as a person lead in Affinity. "
-                f"LinkedIn URL saved as a note.\n🔗 {url}"
-            ),
-            unfurl_links=False,
-            unfurl_media=False,
-        )
     except requests.exceptions.HTTPError as e:
         error_text = e.response.text if hasattr(e.response, "text") else str(e)
         logger.error(f"Affinity person error: {error_text}")
-        client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text=f"<@{poster_id}> ❌ Error adding person: {e.response.status_code} — {error_text}",
-            unfurl_links=False,
-            unfurl_media=False,
-        )
+        err_msg = f"<@{clicker_id}> ❌ Error adding person: {e.response.status_code} — {error_text}"
+        if message_ts:
+            disable_poll_message(client, channel_id, message_ts, err_msg)
+        else:
+            client.chat_postMessage(channel=channel_id, text=err_msg, unfurl_links=False, unfurl_media=False)
     except Exception as e:
         logger.error(f"Error processing LinkedIn person: {e}")
-        client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text=f"<@{poster_id}> ❌ Error adding person: {e}",
-            unfurl_links=False,
-            unfurl_media=False,
-        )
+        err_msg = f"<@{clicker_id}> ❌ Error adding person: {e}"
+        if message_ts:
+            disable_poll_message(client, channel_id, message_ts, err_msg)
+        else:
+            client.chat_postMessage(channel=channel_id, text=err_msg, unfurl_links=False, unfurl_media=False)
 
 
 def _split_query_and_context(seed_text, query_max=120, context_max=1500):
@@ -640,12 +707,30 @@ def search_urls_with_brave(seed_text, max_candidates=3):
 
     raw = ""
     try:
-        logger.info(f"Brave web search — query='{query}' (context {len(context)} chars)")
-
         # Brave prefers short, focused queries. We pass the truncated query only.
+        # If the seed is short (1–2 meaningful tokens, no sector context already in it),
+        # append a business-entity qualifier so Brave biases toward startups/companies
+        # and away from retail/product results (e.g. "Trellis" → gardening trellises).
         brave_query = query
+        name_tokens_short = _name_tokens_for_match(query)
+        # Detect if seed already has sector / business context in it (words like
+        # "AI", "startup", "energy", "semiconductor" etc.). If it does, don't add qualifiers.
+        seed_lower = (context or query or "").lower()
+        has_sector_context = any(
+            kw in seed_lower
+            for kws in KEYWORDS.values()
+            for kw in kws
+        ) or any(w in seed_lower for w in [
+            "startup", "company", "founder", "funded", "raised", "series", "venture",
+            "stealth", "yc ", "y combinator", "techstars",
+        ])
+        if len(name_tokens_short) <= 2 and not has_sector_context:
+            brave_query = f'"{query}" (startup OR company OR Inc OR venture)'
+            logger.info(f"Short seed — appending business qualifiers. Query: {brave_query}")
+
         if len(brave_query) > 400:
             brave_query = brave_query[:400]
+        logger.info(f"Brave web search — query='{brave_query}' (context {len(context)} chars)")
 
         url = "https://api.search.brave.com/res/v1/web/search"
         headers = {
@@ -805,9 +890,15 @@ def rank_candidates(candidates, query=""):
       - a large boost when the company name appears in the candidate's hostname
         (this is what keeps news / PR articles about the company from out-ranking
         the company's actual homepage)
-      - a small penalty for URL paths that look like news articles or blog posts
+      - a penalty for URL paths that look like news articles or blog posts
+      - a penalty for pages dominated by retail / e-commerce signals
 
-    Ties preserve input order (Brave's own ranking).
+    After scoring, candidates with zero sector-keyword hits AND retail signals are
+    dropped entirely. If that would empty the list, the retail candidates stay but
+    the caller gets a flag indicating the pool is off-thesis.
+
+    Returns (ranked_list, all_off_thesis) — the second value is True if none of
+    the candidates hit any Overture sector keyword.
     """
     name_tokens = _name_tokens_for_match(query)
 
@@ -823,6 +914,8 @@ def rank_candidates(candidates, query=""):
     date_path_re = re.compile(r"/20[12]\d/\d{1,2}/")  # /2024/03/, /2026/11/
 
     scored = []
+    sector_hits_by_idx = {}
+    retail_by_idx = {}
     for idx, c in enumerate(candidates):
         url = c["url"]
         m = re.search(r"https?://(?:www\.)?([^/]+)", url)
@@ -842,13 +935,53 @@ def rank_candidates(candidates, query=""):
         if article_path_re.search(url) or date_path_re.search(url):
             path_penalty = 500
 
-        total_keyword, _sectors = score_candidate(url)
+        # Score content: sector keyword hits vs. retail signals
+        page_text = fetch_page_text(url)
+        sector_total = 0
+        if page_text:
+            for sector, words in KEYWORDS.items():
+                for w in words:
+                    if w in page_text:
+                        sector_total += 1
+        retail_hits = sum(1 for k in RETAIL_KEYWORDS if k in (page_text or ""))
 
-        final_score = name_boost + total_keyword - path_penalty
+        sector_hits_by_idx[idx] = sector_total
+        retail_by_idx[idx] = retail_hits
+
+        retail_penalty = 0
+        if retail_hits >= 3:
+            retail_penalty = 400
+        elif retail_hits >= 1:
+            retail_penalty = 150
+
+        final_score = name_boost + sector_total - path_penalty - retail_penalty
         scored.append((final_score, -idx, c))
 
     scored.sort(reverse=True)
-    return [c for _, _, c in scored]
+    ranked = [c for _, _, c in scored]
+
+    # Hard sector filter: drop any candidate with zero sector hits AND retail signals
+    strictly_filtered = []
+    for _score, neg_idx, c in scored:
+        idx = -neg_idx
+        has_sector = sector_hits_by_idx.get(idx, 0) > 0
+        is_retail = retail_by_idx.get(idx, 0) >= 1
+        if has_sector or not is_retail:
+            strictly_filtered.append(c)
+
+    # If filtering empties the list, return [] so the caller surfaces a manual-URL
+    # prompt rather than showing garbage (e.g. garden trellises for "Trellis").
+    if not strictly_filtered:
+        return [], True
+
+    # If any survivor has zero sector hits, flag the whole pool as off-thesis so the
+    # caller can render a warning banner. Otherwise return clean.
+    all_off_thesis = all(
+        sector_hits_by_idx.get(-neg_idx, 0) == 0
+        for _s, neg_idx, _c in scored
+        if _c in strictly_filtered
+    )
+    return strictly_filtered, all_off_thesis
 
 
 def guess_company_domains(query, timeout=5):
@@ -935,11 +1068,14 @@ def guess_company_domains(query, timeout=5):
     return found
 
 
-def build_poll_blocks(seed_text, candidates, poster_id, is_missed, linkedin_url=None):
+def build_poll_blocks(seed_text, candidates, poster_id, is_missed, linkedin_url=None, off_thesis=False):
     """Build Slack Block Kit blocks for the URL-choice poll.
 
     Layout: each candidate is its own section row (URL + description) with a
     Select button accessory. Two bottom buttons: Write in URL / Stealth.
+
+    If off_thesis=True, none of the candidates matched any Overture sector
+    keyword — prepend a warning so Emma knows to double-check.
     """
     if linkedin_url:
         header_text = (
@@ -955,6 +1091,19 @@ def build_poll_blocks(seed_text, candidates, poster_id, is_missed, linkedin_url=
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
     ]
+
+    if off_thesis:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "⚠️ _None of these match Overture's sectors (energy / AI / "
+                    "industry / resilience). Double-check the right company — "
+                    "or hit Write in URL to provide one._"
+                ),
+            },
+        })
 
     # One section per candidate, with a Select button accessory
     for idx, c in enumerate(candidates):
@@ -1063,33 +1212,90 @@ def post_url_poll(client, channel, thread_ts, poster_id, seed_text, is_missed, l
                 if m and m.group(1).lower() not in existing_domains:
                     candidates.append(g)
 
+    def _post_no_match_fallback(text_msg):
+        """Post a no-match fallback with Write-in-URL + Stealth buttons so the
+        poster can resolve with one click — especially useful when a LinkedIn
+        URL is present and we want to stash it as a Stealth note."""
+        reply_value = json.dumps({"poster_id": poster_id})[:1900]
+        stealth_value = json.dumps({
+            "poster_id": poster_id,
+            "is_missed": is_missed,
+            "seed": display_name,
+            "linkedin_url": linkedin_url,
+        })[:1900]
+
+        stealth_label = (
+            "🕶 Stealth (save LinkedIn as note)"
+            if linkedin_url else
+            "🕶 Stealth / no website"
+        )
+
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": text_msg}},
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✍️ Write in URL", "emoji": True},
+                        "action_id": "url_reply_later",
+                        "value": reply_value,
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": stealth_label, "emoji": True},
+                        "action_id": "url_stealth",
+                        "value": stealth_value,
+                        "style": "primary",
+                    },
+                ],
+            },
+        ]
+        client.chat_postMessage(
+            channel=channel,
+            text=text_msg,
+            blocks=blocks,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+
     if not candidates:
         if err:
             # Surface the actual error so we can debug in Slack, not just Railway logs
             fallback = (
-                f"<@{poster_id}> ⚠️ URL search failed for *{display_name}* — `{err}`.\n"
-                f"Please reply with the URL, or say `stealth` and I'll add it as a stealth lead."
+                f"<@{poster_id}> ⚠️ URL search failed for *{display_name}* — `{err}`."
             )
         else:
             fallback = (
-                f"<@{poster_id}> I couldn't find any likely websites for *{display_name}*. "
-                f"Please reply with the URL, or say `stealth` and I'll add it as a stealth lead."
+                f"<@{poster_id}> I couldn't find any likely websites for *{display_name}*."
             )
         if linkedin_url:
-            fallback += f"\n🔗 LinkedIn: {linkedin_url}"
-        client.chat_postMessage(
-            channel=channel,
-            text=fallback,
-            unfurl_links=False,
-            unfurl_media=False,
-        )
+            fallback += f"\n🔗 LinkedIn: <{linkedin_url}|{linkedin_url}>"
+        _post_no_match_fallback(fallback)
         return
 
     # Cap to top 3 after ranking. Pass the query so the ranker can boost
     # domains that match the company name over news/PR articles that merely mention it.
-    candidates = rank_candidates(candidates, query=query_for_rank)[:3]
+    # rank_candidates returns (ranked_list, all_off_thesis_flag).
+    ranked, off_thesis = rank_candidates(candidates, query=query_for_rank)
+    candidates = ranked[:3]
 
-    blocks = build_poll_blocks(display_name, candidates, poster_id, is_missed, linkedin_url=linkedin_url)
+    # If the hard sector filter emptied the pool, bail out with buttons to resolve.
+    if not candidates:
+        fallback = (
+            f"<@{poster_id}> I couldn't find any websites matching Overture's sectors "
+            f"for *{display_name}*. Try adding a short description (e.g. what they do), "
+            f"or use the buttons below."
+        )
+        if linkedin_url:
+            fallback += f"\n🔗 LinkedIn: <{linkedin_url}|{linkedin_url}>"
+        _post_no_match_fallback(fallback)
+        return
+
+    blocks = build_poll_blocks(
+        display_name, candidates, poster_id, is_missed,
+        linkedin_url=linkedin_url, off_thesis=off_thesis,
+    )
     client.chat_postMessage(
         channel=channel,
         text=f"URL guesses for {display_name}",
@@ -1777,6 +1983,150 @@ def handle_url_reply_later(ack, body, client):
         disable_poll_message(client, channel_id, message_ts, resolved)
     except Exception as e:
         logger.error(f"Error in url_reply_later handler: {e}")
+
+
+# ========================================
+# LinkedIn person confirmation handlers
+# ========================================
+
+@app.action("linkedin_person_confirm")
+def handle_linkedin_person_confirm(ack, body, client):
+    """Poster (or anyone) confirmed the parsed LinkedIn name. Create the
+    Affinity Person record with the original parse."""
+    ack()
+    try:
+        clicker_id = body["user"]["id"]
+        channel_id = body["channel"]["id"]
+        message_ts = body["message"]["ts"]
+        payload = json.loads(body["actions"][0]["value"])
+        _create_affinity_person_and_notify(
+            first=payload.get("first", ""),
+            last=payload.get("last", ""),
+            url=payload.get("url", ""),
+            poster_id=payload.get("poster_id"),
+            clicker_id=clicker_id,
+            channel_id=channel_id,
+            client=client,
+            message_ts=message_ts,
+        )
+    except Exception as e:
+        logger.error(f"Error in linkedin_person_confirm handler: {e}")
+
+
+@app.action("linkedin_person_edit")
+def handle_linkedin_person_edit(ack, body, client):
+    """Open a modal for the clicker to correct the parsed name before we
+    create the Affinity Person record."""
+    ack()
+    try:
+        payload = json.loads(body["actions"][0]["value"])
+        channel_id = body["channel"]["id"]
+        message_ts = body["message"]["ts"]
+        trigger_id = body["trigger_id"]
+
+        # private_metadata carries state across the modal round-trip
+        private_metadata = json.dumps({
+            "channel_id": channel_id,
+            "message_ts": message_ts,
+            "url": payload.get("url", ""),
+            "poster_id": payload.get("poster_id"),
+        })[:2950]  # Slack limit is 3000
+
+        view = {
+            "type": "modal",
+            "callback_id": "linkedin_person_edit_submit",
+            "private_metadata": private_metadata,
+            "title": {"type": "plain_text", "text": "Edit person name"},
+            "submit": {"type": "plain_text", "text": "Add to Affinity"},
+            "close": {"type": "plain_text", "text": "Cancel"},
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"Correct the name, then submit to add as a person lead.\n🔗 {payload.get('url', '')}",
+                    },
+                },
+                {
+                    "type": "input",
+                    "block_id": "first_name_block",
+                    "label": {"type": "plain_text", "text": "First name"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "first_name",
+                        "initial_value": payload.get("first", "") or "",
+                    },
+                },
+                {
+                    "type": "input",
+                    "block_id": "last_name_block",
+                    "label": {"type": "plain_text", "text": "Last name"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "last_name",
+                        "initial_value": payload.get("last", "") or "",
+                    },
+                    "optional": True,
+                },
+            ],
+        }
+        client.views_open(trigger_id=trigger_id, view=view)
+    except Exception as e:
+        logger.error(f"Error in linkedin_person_edit handler: {e}")
+
+
+@app.view("linkedin_person_edit_submit")
+def handle_linkedin_person_edit_submit(ack, body, client):
+    """Process the edited name from the modal — create the Affinity Person
+    with the corrected first/last, and replace the original poll message with
+    the resolution status."""
+    ack()
+    try:
+        clicker_id = body["user"]["id"]
+        values = body["view"]["state"]["values"]
+        first = values["first_name_block"]["first_name"]["value"].strip()
+        last_raw = values["last_name_block"]["last_name"].get("value") or ""
+        last = last_raw.strip()
+
+        meta = json.loads(body["view"]["private_metadata"])
+        channel_id = meta["channel_id"]
+        message_ts = meta["message_ts"]
+        url = meta["url"]
+        poster_id = meta["poster_id"]
+
+        _create_affinity_person_and_notify(
+            first=first,
+            last=last,
+            url=url,
+            poster_id=poster_id,
+            clicker_id=clicker_id,
+            channel_id=channel_id,
+            client=client,
+            message_ts=message_ts,
+        )
+    except Exception as e:
+        logger.error(f"Error in linkedin_person_edit_submit handler: {e}")
+
+
+@app.action("linkedin_person_skip")
+def handle_linkedin_person_skip(ack, body, client):
+    """Skip the LinkedIn person add — no Affinity record created."""
+    ack()
+    try:
+        clicker_id = body["user"]["id"]
+        channel_id = body["channel"]["id"]
+        message_ts = body["message"]["ts"]
+        payload = json.loads(body["actions"][0]["value"])
+        poster_id = payload.get("poster_id")
+        name = payload.get("name", "this profile")
+
+        resolved = (
+            f"⏭️ <@{clicker_id}> skipped adding *{name}* to Affinity "
+            f"(from <@{poster_id}>'s LinkedIn post)."
+        )
+        disable_poll_message(client, channel_id, message_ts, resolved)
+    except Exception as e:
+        logger.error(f"Error in linkedin_person_skip handler: {e}")
 
 
 @app.event("app_mention")
