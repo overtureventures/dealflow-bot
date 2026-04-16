@@ -436,6 +436,8 @@ def process_linkedin_person(linkedin_info, poster_id, client, channel_id, thread
                 f"<@{poster_id}> I couldn't parse a name from that LinkedIn URL. "
                 f"Please share the person's name and I'll add them as a lead."
             ),
+            unfurl_links=False,
+            unfurl_media=False,
         )
         return
 
@@ -468,6 +470,8 @@ def process_linkedin_person(linkedin_info, poster_id, client, channel_id, thread
                     f"I added the LinkedIn URL as a note.\n"
                     f"🔗 {url}"
                 ),
+                unfurl_links=False,
+                unfurl_media=False,
             )
             return
 
@@ -489,6 +493,8 @@ def process_linkedin_person(linkedin_info, poster_id, client, channel_id, thread
                 f"<@{poster_id}> ✅ Added *{name}* as a person lead in Affinity. "
                 f"LinkedIn URL saved as a note.\n🔗 {url}"
             ),
+            unfurl_links=False,
+            unfurl_media=False,
         )
     except requests.exceptions.HTTPError as e:
         error_text = e.response.text if hasattr(e.response, "text") else str(e)
@@ -497,6 +503,8 @@ def process_linkedin_person(linkedin_info, poster_id, client, channel_id, thread
             channel=channel_id,
             thread_ts=thread_ts,
             text=f"<@{poster_id}> ❌ Error adding person: {e.response.status_code} — {error_text}",
+            unfurl_links=False,
+            unfurl_media=False,
         )
     except Exception as e:
         logger.error(f"Error processing LinkedIn person: {e}")
@@ -504,6 +512,8 @@ def process_linkedin_person(linkedin_info, poster_id, client, channel_id, thread
             channel=channel_id,
             thread_ts=thread_ts,
             text=f"<@{poster_id}> ❌ Error adding person: {e}",
+            unfurl_links=False,
+            unfurl_media=False,
         )
 
 
@@ -602,7 +612,6 @@ def search_urls_with_brave(seed_text, max_candidates=3):
         logger.info(f"Brave web search — query='{query}' (context {len(context)} chars)")
 
         # Brave prefers short, focused queries. We pass the truncated query only.
-        # Append a couple of domain hints to bias toward company homepages.
         brave_query = query
         if len(brave_query) > 400:
             brave_query = brave_query[:400]
@@ -738,27 +747,28 @@ def rank_candidates(candidates):
 
 
 def build_poll_blocks(seed_text, candidates, poster_id, is_missed, linkedin_url=None):
-    """Build Slack Block Kit blocks for the URL-choice poll."""
+    """Build Slack Block Kit blocks for the URL-choice poll.
+
+    Layout: each candidate is its own section row (URL + description) with a
+    Select button accessory. Two bottom buttons: Write in URL / Stealth.
+    """
     if linkedin_url:
         header_text = (
-            f"<@{poster_id}> shared a LinkedIn company page for *{seed_text}*. "
-            f"Here are my best guesses for their actual website — which is right?"
+            f"<@{poster_id}> shared a LinkedIn company page. "
+            f"Are any of these their actual website?"
         )
     else:
         header_text = (
             f"I couldn't find a URL in <@{poster_id}>'s message. "
-            f"Here are my best guesses for *{seed_text}* — which is right?"
+            f"Are any of these right?"
         )
 
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
     ]
 
-    button_elements = []
+    # One section per candidate, with a Select button accessory
     for idx, c in enumerate(candidates):
-        # Extract domain as button label
-        m = re.search(r"https?://(?:www\.)?([^/]+)", c["url"])
-        domain = m.group(1) if m else c["url"]
         value = json.dumps({
             "url": c["url"],
             "name": c["name"],
@@ -767,55 +777,61 @@ def build_poll_blocks(seed_text, candidates, poster_id, is_missed, linkedin_url=
             "seed": seed_text,
             "linkedin_url": linkedin_url,
         })[:1900]  # Slack value limit is 2000
-        button_elements.append({
-            "type": "button",
-            "text": {"type": "plain_text", "text": domain, "emoji": True},
-            "action_id": f"url_pick_{idx}",
-            "value": value,
+
+        why = (c.get("why") or "").strip()
+        why = re.sub(r"\s+", " ", why)[:180]
+        url_display = c["url"]
+        if why:
+            row_text = f"*{idx+1}.* <{url_display}|{url_display}>\n_{why}_"
+        else:
+            row_text = f"*{idx+1}.* <{url_display}|{url_display}>"
+
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": row_text},
+            "accessory": {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Select", "emoji": True},
+                "action_id": f"url_pick_{idx}",
+                "value": value,
+            },
         })
 
-    # "Stealth" and "Reply later" buttons
+    blocks.append({"type": "divider"})
+
+    # Bottom row: Write in URL + Stealth
+    reply_value = json.dumps({"poster_id": poster_id})[:1900]
     stealth_value = json.dumps({
         "poster_id": poster_id,
         "is_missed": is_missed,
         "seed": seed_text,
         "linkedin_url": linkedin_url,
     })[:1900]
-    reply_value = json.dumps({"poster_id": poster_id})[:1900]
 
-    button_elements.append({
-        "type": "button",
-        "text": {"type": "plain_text", "text": "Stealth / no website", "emoji": True},
-        "action_id": "url_stealth",
-        "value": stealth_value,
-        "style": "primary",
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "✍️ Write in URL", "emoji": True},
+                "action_id": "url_reply_later",
+                "value": reply_value,
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "🕶 Stealth / no website", "emoji": True},
+                "action_id": "url_stealth",
+                "value": stealth_value,
+                "style": "primary",
+            },
+        ],
     })
-    button_elements.append({
-        "type": "button",
-        "text": {"type": "plain_text", "text": "None — I'll reply", "emoji": True},
-        "action_id": "url_reply_later",
-        "value": reply_value,
-    })
-
-    blocks.append({"type": "actions", "elements": button_elements})
-
-    # Show the "why" context under the poll
-    if any(c.get("why") for c in candidates):
-        context_items = []
-        for idx, c in enumerate(candidates):
-            if c.get("why"):
-                context_items.append(f"*{idx+1}.* {c['url']} — {c['why']}")
-        if context_items:
-            blocks.append({
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": "\n".join(context_items)}],
-            })
 
     return blocks
 
 
 def post_url_poll(client, channel, thread_ts, poster_id, seed_text, is_missed, linkedin_url=None):
-    """Search for candidates and post the poll in-thread."""
+    """Search for candidates and post the poll in-channel (not threaded)."""
     logger.info(f"Running URL search poll for seed='{seed_text[:120]}' (linkedin={linkedin_url})")
 
     result = search_urls_with_brave(seed_text, max_candidates=3)
@@ -842,30 +858,38 @@ def post_url_poll(client, channel, thread_ts, poster_id, seed_text, is_missed, l
             fallback += f"\n🔗 LinkedIn: {linkedin_url}"
         client.chat_postMessage(
             channel=channel,
-            thread_ts=thread_ts,
             text=fallback,
+            unfurl_links=False,
+            unfurl_media=False,
         )
         return
 
-    candidates = rank_candidates(candidates)
+    # Cap to top 3 after ranking
+    candidates = rank_candidates(candidates)[:3]
 
     blocks = build_poll_blocks(display_name, candidates, poster_id, is_missed, linkedin_url=linkedin_url)
     client.chat_postMessage(
         channel=channel,
-        thread_ts=thread_ts,
         text=f"URL guesses for {display_name}",
         blocks=blocks,
+        unfurl_links=False,
+        unfurl_media=False,
     )
 
 
 def disable_poll_message(client, channel, ts, resolved_text):
-    """Replace the poll blocks with a resolved-status message so buttons can't be re-clicked."""
+    """Replace the poll blocks with a resolved-status message so buttons can't be re-clicked.
+
+    Also suppresses link unfurls so the final confirmation stays compact.
+    """
     try:
         client.chat_update(
             channel=channel,
             ts=ts,
             text=resolved_text,
             blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": resolved_text}}],
+            unfurl_links=False,
+            unfurl_media=False,
         )
     except Exception as e:
         logger.warning(f"Could not update poll message: {e}")
@@ -1340,7 +1364,9 @@ def handle_message(event, say, client):
                     text=(
                         f"<@{user_id}> I saw a LinkedIn company page but couldn't parse the name. "
                         f"Please reply with the company name or their website URL."
-                    )
+                    ),
+                    unfurl_links=False,
+                    unfurl_media=False,
                 )
                 return
             post_url_poll(
@@ -1380,7 +1406,11 @@ def handle_message(event, say, client):
             slack_user_id=user_id,
             note=note,
         )
-        say(text=f"<@{user_id}> {result['message']}")
+        say(
+            text=f"<@{user_id}> {result['message']}",
+            unfurl_links=False,
+            unfurl_media=False,
+        )
         return
 
     # --- Branch 2: no URL — run search + poll flow ---
@@ -1519,8 +1549,8 @@ def handle_url_reply_later(ack, body, client):
         poster_id = payload.get("poster_id")
 
         resolved = (
-            f"📝 <@{clicker_id}> will reply with the URL for <@{poster_id}>'s post. "
-            f"No Affinity entry created yet — post the URL in-thread and I'll pick it up."
+            f"✍️ <@{clicker_id}> will post the URL for <@{poster_id}>'s lead. "
+            f"No Affinity entry created yet — drop the URL in this channel and I'll pick it up."
         )
         disable_poll_message(client, channel_id, message_ts, resolved)
     except Exception as e:
