@@ -47,6 +47,11 @@ STAGE_THRESHOLDS = {
 
 # Affinity field IDs
 STATUS_FIELD_ID = 4927710
+# Dropdown value IDs on the STATUS_FIELD. Set STEALTH_STATUS_VALUE_ID to the
+# Affinity dropdown ID for your Stealth stage — run get-affinity-fields.js to
+# find it. When None, the bot falls back to "note-only stealth" (creates the
+# org + attaches a Stealth note without tagging the stage field).
+STEALTH_STATUS_VALUE_ID = None  # TODO: set to the Stealth dropdown ID
 OWNERS_FIELD_ID = 4927712
 PASS_REASON_FIELD_ID = 4944316
 MISSED_STATUS_VALUE_ID = 20689035
@@ -466,11 +471,12 @@ def strip_linkedin_urls(text):
 
 
 def process_linkedin_person(linkedin_info, poster_id, client, channel_id, thread_ts):
-    """Post a confirmation poll so the poster can verify the parsed name
-    before we create an Affinity Person record. Posts in-channel (not threaded).
+    """Add a LinkedIn /in/ person directly as a Stealth org in Affinity.
+
+    The person's parsed name becomes the org name (placeholder until the real
+    company is known); the LinkedIn URL is attached as a note. No Slack
+    confirmation step — this fires-and-forgets straight to Affinity.
     """
-    first = linkedin_info.get("first_name", "")
-    last = linkedin_info.get("last_name", "")
     name = linkedin_info.get("name", "").strip()
     url = linkedin_info["url"]
 
@@ -479,7 +485,7 @@ def process_linkedin_person(linkedin_info, poster_id, client, channel_id, thread
             channel=channel_id,
             text=(
                 f"<@{poster_id}> I couldn't parse a name from that LinkedIn URL. "
-                f"Please share the person's name and I'll add them as a lead.\n"
+                f"Please share the person's name and I'll add them as a Stealth lead.\n"
                 f"🔗 {url}"
             ),
             unfurl_links=False,
@@ -487,132 +493,110 @@ def process_linkedin_person(linkedin_info, poster_id, client, channel_id, thread
         )
         return
 
-    # Build confirmation poll with Confirm / Edit / Skip buttons
-    payload = json.dumps({
-        "first": first,
-        "last": last,
-        "name": name,
-        "url": url,
-        "poster_id": poster_id,
-    })[:1900]
-
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"<@{poster_id}> shared a LinkedIn profile. "
-                    f"I parsed the name as *{name}*. Is this right?\n"
-                    f"🔗 <{url}|{url}>"
-                ),
-            },
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "✅ Confirm & add", "emoji": True},
-                    "action_id": "linkedin_person_confirm",
-                    "value": payload,
-                    "style": "primary",
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "✏️ Edit name", "emoji": True},
-                    "action_id": "linkedin_person_edit",
-                    "value": payload,
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "⏭️ Skip", "emoji": True},
-                    "action_id": "linkedin_person_skip",
-                    "value": payload,
-                },
-            ],
-        },
-    ]
-
-    client.chat_postMessage(
-        channel=channel_id,
-        text=f"Confirm person: {name}",
-        blocks=blocks,
-        unfurl_links=False,
-        unfurl_media=False,
+    note = (
+        f"Stealth — placeholder from LinkedIn profile. "
+        f"LinkedIn: {url} (shared by <@{poster_id}> via dealflow-bot)"
     )
-
-
-def _create_affinity_person_and_notify(first, last, url, poster_id, clicker_id, channel_id, client, message_ts=None):
-    """Shared helper: create/find the Affinity Person, attach LinkedIn note,
-    and post (or update) the resolution message in the channel.
-
-    Called from the linkedin_person_confirm button handler and from the
-    linkedin-edit modal submission.
-    """
-    name = f"{first} {last}".strip() or first or last or "Unknown"
     try:
-        existing = affinity.search_person(name)
-        match = None
-        for p in existing:
-            p_first = (p.get("first_name") or "").lower()
-            p_last = (p.get("last_name") or "").lower()
-            if p_first == first.lower() and p_last == last.lower():
-                match = p
-                break
-
-        if match:
-            person_id = match["id"]
-            try:
-                affinity.create_person_note(
-                    person_id,
-                    f"LinkedIn: {url} (shared by <@{poster_id}>, confirmed by <@{clicker_id}> via dealflow-bot)",
-                )
-            except Exception as e:
-                logger.warning(f"Could not add note to existing person: {e}")
-            resolved = (
-                f"<@{clicker_id}> confirmed *{name}* — already in Affinity as a person. "
-                f"LinkedIn URL added as a note.\n🔗 {url}"
-            )
-        else:
-            person = affinity.create_person(first_name=first, last_name=last or "")
-            person_id = person.get("id")
-            try:
-                affinity.create_person_note(
-                    person_id,
-                    f"LinkedIn: {url} (shared by <@{poster_id}>, confirmed by <@{clicker_id}> via dealflow-bot)",
-                )
-            except Exception as e:
-                logger.warning(f"Could not add note to new person: {e}")
-            resolved = (
-                f"✅ <@{clicker_id}> added *{name}* as a person lead in Affinity for <@{poster_id}>'s post. "
-                f"LinkedIn saved as a note.\n🔗 {url}"
-            )
-
-        if message_ts:
-            disable_poll_message(client, channel_id, message_ts, resolved)
-        else:
-            client.chat_postMessage(
-                channel=channel_id,
-                text=resolved,
-                unfurl_links=False,
-                unfurl_media=False,
-            )
+        result = process_company(
+            search_term=name,
+            domain=None,
+            is_missed=False,
+            slack_user_id=poster_id,
+            note=note,
+            stealth=True,
+        )
+        text_msg = (
+            f"<@{poster_id}> 🕶 {result['message']}\n"
+            f"🔗 LinkedIn: <{url}|{url}>"
+        )
+        client.chat_postMessage(
+            channel=channel_id,
+            text=text_msg,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
     except requests.exceptions.HTTPError as e:
         error_text = e.response.text if hasattr(e.response, "text") else str(e)
-        logger.error(f"Affinity person error: {error_text}")
-        err_msg = f"<@{clicker_id}> ❌ Error adding person: {e.response.status_code} — {error_text}"
-        if message_ts:
-            disable_poll_message(client, channel_id, message_ts, err_msg)
-        else:
-            client.chat_postMessage(channel=channel_id, text=err_msg, unfurl_links=False, unfurl_media=False)
+        logger.error(f"Affinity error adding Stealth from LinkedIn person: {error_text}")
+        client.chat_postMessage(
+            channel=channel_id,
+            text=f"<@{poster_id}> ❌ Error adding Stealth: {e.response.status_code} — {error_text}",
+            unfurl_links=False,
+            unfurl_media=False,
+        )
     except Exception as e:
         logger.error(f"Error processing LinkedIn person: {e}")
-        err_msg = f"<@{clicker_id}> ❌ Error adding person: {e}"
-        if message_ts:
-            disable_poll_message(client, channel_id, message_ts, err_msg)
-        else:
-            client.chat_postMessage(channel=channel_id, text=err_msg, unfurl_links=False, unfurl_media=False)
+        client.chat_postMessage(
+            channel=channel_id,
+            text=f"<@{poster_id}> ❌ Error adding Stealth: {e}",
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+
+
+def process_linkedin_company(linkedin_info, poster_id, client, channel_id, is_missed=False):
+    """Add a LinkedIn /company/ entry directly as an org in Affinity.
+
+    Uses the parsed company name; attaches the LinkedIn URL as a note. No
+    URL-search poll, no domain (those can be added to the Affinity record
+    manually if/when the company has a website).
+    """
+    name = (linkedin_info.get("name") or "").strip()
+    url = linkedin_info["url"]
+
+    if not name:
+        client.chat_postMessage(
+            channel=channel_id,
+            text=(
+                f"<@{poster_id}> I couldn't parse a company name from that LinkedIn URL. "
+                f"Please reply with the company name or their website URL.\n"
+                f"🔗 {url}"
+            ),
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+        return
+
+    note = (
+        f"LinkedIn company page: {url} (shared by <@{poster_id}> via dealflow-bot)"
+    )
+    try:
+        result = process_company(
+            search_term=name,
+            domain=None,
+            is_missed=is_missed,
+            slack_user_id=poster_id,
+            note=note,
+            stealth=False,
+        )
+        text_msg = (
+            f"<@{poster_id}> {result['message']}\n"
+            f"🔗 LinkedIn: <{url}|{url}>"
+        )
+        client.chat_postMessage(
+            channel=channel_id,
+            text=text_msg,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+    except requests.exceptions.HTTPError as e:
+        error_text = e.response.text if hasattr(e.response, "text") else str(e)
+        logger.error(f"Affinity error adding org from LinkedIn company: {error_text}")
+        client.chat_postMessage(
+            channel=channel_id,
+            text=f"<@{poster_id}> ❌ Error adding company: {e.response.status_code} — {error_text}",
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+    except Exception as e:
+        logger.error(f"Error processing LinkedIn company: {e}")
+        client.chat_postMessage(
+            channel=channel_id,
+            text=f"<@{poster_id}> ❌ Error adding company: {e}",
+            unfurl_links=False,
+            unfurl_media=False,
+        )
 
 
 def _split_query_and_context(seed_text, query_max=120, context_max=1500):
@@ -1414,8 +1398,14 @@ def get_list_entry_details(org_id, list_id):
         return [], []
 
 
-def process_company(search_term, domain=None, is_missed=False, slack_user_id=None, note=None):
-    """Check if company exists in deal pipeline. If yes, return current stage. If no, add it."""
+def process_company(search_term, domain=None, is_missed=False, slack_user_id=None, note=None, stealth=False):
+    """Check if company exists in deal pipeline. If yes, return current stage. If no, add it.
+
+    When stealth=True and STEALTH_STATUS_VALUE_ID is configured, the new list
+    entry gets its status field set to Stealth. Without STEALTH_STATUS_VALUE_ID
+    the stealth flag is a no-op at the status-field level (the note still
+    records the Stealth designation).
+    """
     try:
         # Search using domain if available, otherwise use name
         term = domain if domain else search_term
@@ -1496,16 +1486,24 @@ def process_company(search_term, domain=None, is_missed=False, slack_user_id=Non
                     except Exception as e:
                         logger.error(f"Error setting missed status: {e}")
 
+                # If marked as stealth, set the status (if configured)
+                if stealth and STEALTH_STATUS_VALUE_ID is not None:
+                    try:
+                        affinity.set_field_value(STATUS_FIELD_ID, org_id, list_entry["id"], STEALTH_STATUS_VALUE_ID)
+                    except Exception as e:
+                        logger.error(f"Error setting stealth status: {e}")
+
                 if note:
                     try:
                         affinity.create_note(org_id, note)
                     except Exception as e:
                         logger.error(f"Error creating note: {e}")
 
+                msg_suffix = " as *Stealth*" if stealth else " as a new lead"
                 return {
                     "status": "added",
                     "company": org_name,
-                    "message": f"✅ Added *{org_name}* to the deal pipeline as a new lead."
+                    "message": f"✅ Added *{org_name}* to the deal pipeline{msg_suffix}."
                 }
         else:
             # Create new organization and add to pipeline
@@ -1543,16 +1541,24 @@ def process_company(search_term, domain=None, is_missed=False, slack_user_id=Non
                 except Exception as e:
                     logger.error(f"Error setting missed status: {e}")
 
+            # If marked as stealth, set the status (if configured)
+            if stealth and STEALTH_STATUS_VALUE_ID is not None:
+                try:
+                    affinity.set_field_value(STATUS_FIELD_ID, org_id, list_entry["id"], STEALTH_STATUS_VALUE_ID)
+                except Exception as e:
+                    logger.error(f"Error setting stealth status: {e}")
+
             if note:
                 try:
                     affinity.create_note(org_id, note)
                 except Exception as e:
                     logger.error(f"Error creating note: {e}")
 
+            msg_suffix = " as *Stealth*" if stealth else " as a new lead"
             return {
                 "status": "created",
                 "company": org_name,
-                "message": f"✅ Created *{org_name}* and added to the deal pipeline as a new lead."
+                "message": f"✅ Created *{org_name}* and added to the deal pipeline{msg_suffix}."
             }
 
     except requests.exceptions.HTTPError as e:
@@ -1786,25 +1792,14 @@ def handle_message(event, say, client):
             return
         elif linkedin_info["type"] == "company":
             logger.info(f"LinkedIn company URL detected: {linkedin_info['url']}")
-            seed = linkedin_info["name"] or clean_seed_text(text_without_linkedin)
-            if not seed or len(seed) < MIN_POLL_MESSAGE_LENGTH:
-                say(
-                    text=(
-                        f"<@{user_id}> I saw a LinkedIn company page but couldn't parse the name. "
-                        f"Please reply with the company name or their website URL."
-                    ),
-                    unfurl_links=False,
-                    unfurl_media=False,
-                )
-                return
-            post_url_poll(
-                client=client,
-                channel=channel_id,
-                thread_ts=thread_ts,
+            # Direct-add: no URL-search poll, no confirmation. Uses the parsed
+            # company name + LinkedIn URL as a note.
+            process_linkedin_company(
+                linkedin_info,
                 poster_id=user_id,
-                seed_text=seed,
+                client=client,
+                channel_id=channel_id,
                 is_missed=is_missed,
-                linkedin_url=linkedin_info["url"],
             )
             return
         else:
@@ -1983,150 +1978,6 @@ def handle_url_reply_later(ack, body, client):
         disable_poll_message(client, channel_id, message_ts, resolved)
     except Exception as e:
         logger.error(f"Error in url_reply_later handler: {e}")
-
-
-# ========================================
-# LinkedIn person confirmation handlers
-# ========================================
-
-@app.action("linkedin_person_confirm")
-def handle_linkedin_person_confirm(ack, body, client):
-    """Poster (or anyone) confirmed the parsed LinkedIn name. Create the
-    Affinity Person record with the original parse."""
-    ack()
-    try:
-        clicker_id = body["user"]["id"]
-        channel_id = body["channel"]["id"]
-        message_ts = body["message"]["ts"]
-        payload = json.loads(body["actions"][0]["value"])
-        _create_affinity_person_and_notify(
-            first=payload.get("first", ""),
-            last=payload.get("last", ""),
-            url=payload.get("url", ""),
-            poster_id=payload.get("poster_id"),
-            clicker_id=clicker_id,
-            channel_id=channel_id,
-            client=client,
-            message_ts=message_ts,
-        )
-    except Exception as e:
-        logger.error(f"Error in linkedin_person_confirm handler: {e}")
-
-
-@app.action("linkedin_person_edit")
-def handle_linkedin_person_edit(ack, body, client):
-    """Open a modal for the clicker to correct the parsed name before we
-    create the Affinity Person record."""
-    ack()
-    try:
-        payload = json.loads(body["actions"][0]["value"])
-        channel_id = body["channel"]["id"]
-        message_ts = body["message"]["ts"]
-        trigger_id = body["trigger_id"]
-
-        # private_metadata carries state across the modal round-trip
-        private_metadata = json.dumps({
-            "channel_id": channel_id,
-            "message_ts": message_ts,
-            "url": payload.get("url", ""),
-            "poster_id": payload.get("poster_id"),
-        })[:2950]  # Slack limit is 3000
-
-        view = {
-            "type": "modal",
-            "callback_id": "linkedin_person_edit_submit",
-            "private_metadata": private_metadata,
-            "title": {"type": "plain_text", "text": "Edit person name"},
-            "submit": {"type": "plain_text", "text": "Add to Affinity"},
-            "close": {"type": "plain_text", "text": "Cancel"},
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"Correct the name, then submit to add as a person lead.\n🔗 {payload.get('url', '')}",
-                    },
-                },
-                {
-                    "type": "input",
-                    "block_id": "first_name_block",
-                    "label": {"type": "plain_text", "text": "First name"},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "first_name",
-                        "initial_value": payload.get("first", "") or "",
-                    },
-                },
-                {
-                    "type": "input",
-                    "block_id": "last_name_block",
-                    "label": {"type": "plain_text", "text": "Last name"},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "last_name",
-                        "initial_value": payload.get("last", "") or "",
-                    },
-                    "optional": True,
-                },
-            ],
-        }
-        client.views_open(trigger_id=trigger_id, view=view)
-    except Exception as e:
-        logger.error(f"Error in linkedin_person_edit handler: {e}")
-
-
-@app.view("linkedin_person_edit_submit")
-def handle_linkedin_person_edit_submit(ack, body, client):
-    """Process the edited name from the modal — create the Affinity Person
-    with the corrected first/last, and replace the original poll message with
-    the resolution status."""
-    ack()
-    try:
-        clicker_id = body["user"]["id"]
-        values = body["view"]["state"]["values"]
-        first = values["first_name_block"]["first_name"]["value"].strip()
-        last_raw = values["last_name_block"]["last_name"].get("value") or ""
-        last = last_raw.strip()
-
-        meta = json.loads(body["view"]["private_metadata"])
-        channel_id = meta["channel_id"]
-        message_ts = meta["message_ts"]
-        url = meta["url"]
-        poster_id = meta["poster_id"]
-
-        _create_affinity_person_and_notify(
-            first=first,
-            last=last,
-            url=url,
-            poster_id=poster_id,
-            clicker_id=clicker_id,
-            channel_id=channel_id,
-            client=client,
-            message_ts=message_ts,
-        )
-    except Exception as e:
-        logger.error(f"Error in linkedin_person_edit_submit handler: {e}")
-
-
-@app.action("linkedin_person_skip")
-def handle_linkedin_person_skip(ack, body, client):
-    """Skip the LinkedIn person add — no Affinity record created."""
-    ack()
-    try:
-        clicker_id = body["user"]["id"]
-        channel_id = body["channel"]["id"]
-        message_ts = body["message"]["ts"]
-        payload = json.loads(body["actions"][0]["value"])
-        poster_id = payload.get("poster_id")
-        name = payload.get("name", "this profile")
-
-        resolved = (
-            f"⏭️ <@{clicker_id}> skipped adding *{name}* to Affinity "
-            f"(from <@{poster_id}>'s LinkedIn post)."
-        )
-        disable_poll_message(client, channel_id, message_ts, resolved)
-    except Exception as e:
-        logger.error(f"Error in linkedin_person_skip handler: {e}")
 
 
 @app.event("app_mention")
