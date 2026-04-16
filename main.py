@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import logging
 import threading
 from datetime import datetime, timedelta
@@ -18,6 +19,7 @@ SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
 AFFINITY_API_KEY = os.environ.get("AFFINITY_API_KEY")
 AFFINITY_LIST_ID = os.environ.get("AFFINITY_LIST_ID")
 NUDGE_CHANNEL_ID = os.environ.get("NUDGE_CHANNEL_ID")  # #deal-nudges channel ID
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 # Owner name to Slack ID mapping
 OWNER_SLACK_MAP = {
@@ -48,6 +50,62 @@ STATUS_FIELD_ID = 4927710
 OWNERS_FIELD_ID = 4927712
 PASS_REASON_FIELD_ID = 4944316
 MISSED_STATUS_VALUE_ID = 20689035
+
+# Overture sector keywords — used to rank candidate websites found via search.
+# Matched case-insensitively against candidate homepage text.
+KEYWORDS = {
+    "energy": [
+        "renewable", "clean energy", "solar", "wind", "geothermal", "nuclear",
+        "smr", "fusion", "hydrogen", "battery", "energy storage", "bess",
+        "grid", "microgrid", "transmission", "electrification", "decarbonization",
+        "decarbonize", "net zero", "net-zero", "emissions", "utility", "kilowatt",
+        "megawatt", "gigawatt", "ev charging", "heat pump", "biofuel", "rng",
+        "carbon capture", "ccus", "dac", "demand response", "virtual power plant",
+        "vpp",
+    ],
+    "ai": [
+        "artificial intelligence", "machine learning", "llm", "foundation model",
+        "generative ai", "agent", "agentic", "neural network", "transformer",
+        "computer vision", "nlp", "mlops", "fine-tuning", "inference", "rag",
+        "vector database", "gpu", "accelerator", "autonomous", "ai infrastructure",
+        "ai platform", "ai safety", "alignment",
+    ],
+    "industry": [
+        "manufacturing", "advanced manufacturing", "factory", "robotics", "cobots",
+        "automation", "supply chain", "logistics", "additive manufacturing",
+        "3d printing", "cnc", "industrial iot", "iiot", "digital twin", "sensors",
+        "advanced materials", "composites", "construction tech", "mining",
+        "critical minerals", "rare earths", "semiconductor", "fab", "steel",
+        "cement", "chemicals", "warehouse", "defense tech", "dual-use",
+        "aerospace", "space", "satellites",
+    ],
+    "resilience": [
+        "climate resilience", "climate adaptation", "disaster response",
+        "emergency management", "wildfire", "flood", "hurricane", "extreme weather",
+        "critical infrastructure", "grid hardening", "water infrastructure",
+        "drought", "parametric insurance", "climate insurance", "national security",
+        "homeland security", "food security", "agtech", "precision agriculture",
+        "earth observation", "geospatial", "remote sensing", "weather forecasting",
+        "supply chain resilience", "reshoring",
+    ],
+    "crosscutting": [
+        "hard tech", "deep tech", "climate tech", "cleantech", "greentech",
+        "hardware", "pilot", "commercial-scale", "series a", "series b", "seed",
+        "founder", "ceo",
+    ],
+}
+
+# Domains to exclude from URL search candidates — these are never the "real" company site
+EXCLUDED_DOMAINS = {
+    "linkedin.com", "crunchbase.com", "pitchbook.com", "wikipedia.org",
+    "twitter.com", "x.com", "facebook.com", "instagram.com", "youtube.com",
+    "medium.com", "substack.com", "techcrunch.com", "forbes.com", "bloomberg.com",
+    "reuters.com", "wsj.com", "ft.com", "nytimes.com", "axios.com",
+    "bing.com", "google.com", "duckduckgo.com",
+}
+
+# Minimum characters in a no-URL message before we trigger the URL-search poll
+MIN_POLL_MESSAGE_LENGTH = 3
 
 app = App(token=SLACK_BOT_TOKEN)
 
@@ -164,6 +222,19 @@ class AffinityClient:
         response.raise_for_status()
         return response.json()
 
+    def create_note(self, organization_id, content):
+        """Attach a note to an organization."""
+        payload = {
+            "organization_ids": [organization_id],
+            "content": content,
+        }
+        response = self.session.post(
+            f"{AFFINITY_BASE_URL}/notes",
+            json=payload
+        )
+        response.raise_for_status()
+        return response.json()
+
 
 affinity = AffinityClient(AFFINITY_API_KEY)
 
@@ -173,7 +244,7 @@ def extract_company_info(text):
     # Try to extract URL/domain
     url_pattern = r'https?://(?:www\.)?([a-zA-Z0-9-]+\.[a-zA-Z0-9.-]+)'
     domain_pattern = r'\b([a-zA-Z0-9-]+\.(?:com|io|co|ai|org|net|app|vc|xyz|tech|dev))\b'
-    
+
     domain = None
     url_match = re.search(url_pattern, text)
     if url_match:
@@ -182,7 +253,7 @@ def extract_company_info(text):
         domain_match = re.search(domain_pattern, text)
         if domain_match:
             domain = domain_match.group(1)
-    
+
     # Clean up the company name
     company_name = text.strip()
     company_name = re.sub(r'https?://(?:www\.)?', '', company_name)
@@ -190,7 +261,7 @@ def extract_company_info(text):
     # Remove missed/miss/missing keywords
     company_name = re.sub(r'\b(missed|miss|missing|we|this|one|was|a)\b', '', company_name, flags=re.IGNORECASE)
     company_name = company_name.strip(' -–—:/')
-    
+
     # If we have a domain, use it as the search term
     if domain:
         # Remove trailing paths from domain
@@ -198,8 +269,278 @@ def extract_company_info(text):
         # Use domain as company name if text is just a URL
         if not company_name or company_name == domain:
             company_name = domain.split('.')[0].title()
-    
+
     return company_name, domain
+
+
+def strip_urls(text):
+    """Remove URLs from text, leaving only plain words — used to build a search seed."""
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'\b[a-zA-Z0-9-]+\.(?:com|io|co|ai|org|net|app|vc|xyz|tech|dev)\S*', '', text)
+    return text.strip()
+
+
+def clean_seed_text(text):
+    """Strip filler words and 'missed' keywords to build a cleaner search seed."""
+    text = strip_urls(text)
+    text = re.sub(r'\b(missed|miss|missing|we|this|one|was|a|the)\b', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'[\(\)\[\]<>]', '', text)
+    return " ".join(text.split()).strip()
+
+
+def search_urls_with_openai(seed_text, max_candidates=3):
+    """
+    Use OpenAI web search to find candidate company URLs for a given seed.
+    Returns a list of dicts: [{"url": str, "name": str, "why": str}, ...]
+    """
+    if not OPENAI_API_KEY:
+        logger.error("OPENAI_API_KEY not set — cannot run URL search")
+        return []
+
+    sector_list = ", ".join(KEYWORDS.keys())
+    excluded = ", ".join(sorted(EXCLUDED_DOMAINS))
+
+    prompt = (
+        f"You are helping a VC firm (Overture Ventures) identify a company's official website. "
+        f"Overture invests in {sector_list} (energy, AI, industrial transformation, resilience). "
+        f"Based on the following text from a team member, find up to {max_candidates} candidate "
+        f"official company websites that best match. Prefer companies whose work aligns with "
+        f"Overture's sectors. Text: '{seed_text}'\n\n"
+        f"Rules:\n"
+        f"- Return ONLY official company websites, not news articles, social profiles, directories, or aggregators.\n"
+        f"- Never return any of these domains: {excluded}.\n"
+        f"- If you cannot find plausible candidates, return an empty list.\n"
+        f"- Respond ONLY with a JSON array of objects, each with keys 'url', 'name', 'why'. "
+        f"No prose, no markdown, no code fences."
+    )
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+
+        response = client.responses.create(
+            model="gpt-4o",
+            tools=[{"type": "web_search_preview"}],
+            input=prompt,
+        )
+
+        # Grab the output text
+        raw = getattr(response, "output_text", None)
+        if not raw:
+            # Fallback: walk the output list
+            for item in getattr(response, "output", []) or []:
+                if getattr(item, "type", None) == "message":
+                    for c in item.content or []:
+                        if getattr(c, "type", None) == "output_text":
+                            raw = c.text
+                            break
+                if raw:
+                    break
+
+        if not raw:
+            logger.error("OpenAI returned empty response for URL search")
+            return []
+
+        # Strip any accidental code fences
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
+
+        # Find the first JSON array in the text
+        match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
+        if not match:
+            logger.error(f"Could not find JSON array in OpenAI response: {raw[:500]}")
+            return []
+
+        candidates = json.loads(match.group(0))
+        if not isinstance(candidates, list):
+            return []
+
+        # Filter excluded domains and dedupe by domain
+        cleaned = []
+        seen_domains = set()
+        for c in candidates:
+            url = c.get("url") if isinstance(c, dict) else None
+            if not url or not isinstance(url, str):
+                continue
+            # Extract domain
+            m = re.search(r"https?://(?:www\.)?([^/]+)", url)
+            domain = m.group(1).lower() if m else url.lower()
+            if any(ex in domain for ex in EXCLUDED_DOMAINS):
+                continue
+            if domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+            cleaned.append({
+                "url": url,
+                "name": c.get("name") or domain.split(".")[0].title(),
+                "why": c.get("why") or "",
+            })
+            if len(cleaned) >= max_candidates:
+                break
+        return cleaned
+
+    except Exception as e:
+        logger.error(f"OpenAI URL search failed: {e}")
+        return []
+
+
+def fetch_page_text(url, timeout=8):
+    """Fetch a URL's homepage and return plaintext (rough, no HTML parser)."""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Overture dealflow-bot)"}
+        r = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True)
+        if not r.ok:
+            return ""
+        text = r.text
+        text = re.sub(r"<script.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<style.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text[:8000].lower()
+    except Exception as e:
+        logger.warning(f"Could not fetch {url}: {e}")
+        return ""
+
+
+def score_candidate(url):
+    """
+    Fetch candidate homepage and score by Overture keyword matches.
+    Returns (total_hits, {sector: hits}).
+    """
+    text = fetch_page_text(url)
+    if not text:
+        return 0, {}
+    sector_hits = {}
+    for sector, words in KEYWORDS.items():
+        hits = 0
+        for w in words:
+            if w in text:
+                hits += 1
+        if hits > 0:
+            sector_hits[sector] = hits
+    total = sum(sector_hits.values())
+    return total, sector_hits
+
+
+def rank_candidates(candidates):
+    """Score each candidate and sort by descending match. Preserves input order on ties."""
+    scored = []
+    for idx, c in enumerate(candidates):
+        total, sectors = score_candidate(c["url"])
+        scored.append((total, -idx, c))
+    scored.sort(reverse=True)
+    return [c for _, _, c in scored]
+
+
+def build_poll_blocks(seed_text, candidates, poster_id, is_missed):
+    """Build Slack Block Kit blocks for the URL-choice poll."""
+    header_text = (
+        f"I couldn't find a URL in <@{poster_id}>'s message. "
+        f"Here are my best guesses for *{seed_text}* — which is right?"
+    )
+
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
+    ]
+
+    button_elements = []
+    for idx, c in enumerate(candidates):
+        # Extract domain as button label
+        m = re.search(r"https?://(?:www\.)?([^/]+)", c["url"])
+        domain = m.group(1) if m else c["url"]
+        value = json.dumps({
+            "url": c["url"],
+            "name": c["name"],
+            "poster_id": poster_id,
+            "is_missed": is_missed,
+            "seed": seed_text,
+        })[:1900]  # Slack value limit is 2000
+        button_elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": domain, "emoji": True},
+            "action_id": f"url_pick_{idx}",
+            "value": value,
+        })
+
+    # "Stealth" and "Reply later" buttons
+    stealth_value = json.dumps({
+        "poster_id": poster_id,
+        "is_missed": is_missed,
+        "seed": seed_text,
+    })[:1900]
+    reply_value = json.dumps({"poster_id": poster_id})[:1900]
+
+    button_elements.append({
+        "type": "button",
+        "text": {"type": "plain_text", "text": "Stealth / no website", "emoji": True},
+        "action_id": "url_stealth",
+        "value": stealth_value,
+        "style": "primary",
+    })
+    button_elements.append({
+        "type": "button",
+        "text": {"type": "plain_text", "text": "None — I'll reply", "emoji": True},
+        "action_id": "url_reply_later",
+        "value": reply_value,
+    })
+
+    blocks.append({"type": "actions", "elements": button_elements})
+
+    # Show the "why" context under the poll
+    if any(c.get("why") for c in candidates):
+        context_items = []
+        for idx, c in enumerate(candidates):
+            if c.get("why"):
+                context_items.append(f"*{idx+1}.* {c['url']} — {c['why']}")
+        if context_items:
+            blocks.append({
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": "\n".join(context_items)}],
+            })
+
+    return blocks
+
+
+def post_url_poll(client, channel, thread_ts, poster_id, seed_text, is_missed):
+    """Search for candidates and post the poll in-thread."""
+    logger.info(f"Running URL search poll for seed='{seed_text}'")
+
+    candidates = search_urls_with_openai(seed_text, max_candidates=3)
+
+    if not candidates:
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=(
+                f"<@{poster_id}> I couldn't find any likely websites for *{seed_text}*. "
+                f"Please reply with the URL, or say `stealth` and I'll add it as a stealth lead."
+            ),
+        )
+        return
+
+    candidates = rank_candidates(candidates)
+
+    blocks = build_poll_blocks(seed_text, candidates, poster_id, is_missed)
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts,
+        text=f"URL guesses for {seed_text}",
+        blocks=blocks,
+    )
+
+
+def disable_poll_message(client, channel, ts, resolved_text):
+    """Replace the poll blocks with a resolved-status message so buttons can't be re-clicked."""
+    try:
+        client.chat_update(
+            channel=channel,
+            ts=ts,
+            text=resolved_text,
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": resolved_text}}],
+        )
+    except Exception as e:
+        logger.warning(f"Could not update poll message: {e}")
 
 
 def get_stage_name(organization_id, list_id):
@@ -209,7 +550,7 @@ def get_stage_name(organization_id, list_id):
         fields = affinity.get_list_fields(list_id)
         stage_field_id = None
         stage_options = {}
-        
+
         for field in fields:
             field_name = field.get("name", "").lower()
             if field_name in ["stage", "status", "deal stage"]:
@@ -218,13 +559,13 @@ def get_stage_name(organization_id, list_id):
                 for option in field.get("dropdown_options", []):
                     stage_options[option["id"]] = option["text"]
                 break
-        
+
         if not stage_field_id:
             return "Unknown"
-        
+
         # Get field values for this organization
         field_values = affinity.get_field_values(organization_id)
-        
+
         for fv in field_values:
             if fv.get("field_id") == stage_field_id:
                 value = fv.get("value")
@@ -233,7 +574,7 @@ def get_stage_name(organization_id, list_id):
                 elif isinstance(value, int) and value in stage_options:
                     return stage_options[value]
                 return str(value) if value else "Not set"
-        
+
         return "Not set"
     except Exception as e:
         logger.error(f"Error getting stage: {e}")
@@ -259,15 +600,15 @@ def get_list_entry_details(org_id, list_id):
     try:
         org = affinity.get_organization(org_id)
         list_entries = org.get("list_entries", [])
-        
+
         for entry in list_entries:
             if entry.get("list_id") == int(list_id):
                 list_entry_id = entry.get("id")
                 field_values = affinity.get_list_entry_field_values(list_entry_id)
-                
+
                 owners = []
                 pass_reasons = []
-                
+
                 for fv in field_values:
                     # Get owners
                     if fv.get("field_id") == OWNERS_FIELD_ID:
@@ -276,7 +617,7 @@ def get_list_entry_details(org_id, list_id):
                             owner_name = get_owner_name_from_id(person_id)
                             if owner_name:
                                 owners.append(owner_name)
-                    
+
                     # Get pass reason
                     if fv.get("field_id") == PASS_REASON_FIELD_ID:
                         value = fv.get("value")
@@ -284,25 +625,25 @@ def get_list_entry_details(org_id, list_id):
                             pass_reasons.append(value["text"])
                         elif value:
                             pass_reasons.append(str(value))
-                
+
                 return owners, pass_reasons
-        
+
         return [], []
     except Exception as e:
         logger.error(f"Error getting list entry details: {e}")
         return [], []
 
 
-def process_company(search_term, domain=None, is_missed=False, slack_user_id=None):
+def process_company(search_term, domain=None, is_missed=False, slack_user_id=None, note=None):
     """Check if company exists in deal pipeline. If yes, return current stage. If no, add it."""
     try:
         # Search using domain if available, otherwise use name
         term = domain if domain else search_term
         logger.info(f"Searching for: {term}")
-        
+
         orgs = affinity.search_organization(term)
         logger.info(f"Found {len(orgs)} organizations")
-        
+
         organization = None
         if orgs:
             # Find best match
@@ -317,28 +658,28 @@ def process_company(search_term, domain=None, is_missed=False, slack_user_id=Non
                     break
             if not organization:
                 organization = orgs[0]
-        
+
         if organization:
             org_id = organization["id"]
             org_name = organization["name"]
             logger.info(f"Found organization: {org_name} (ID: {org_id})")
-            
+
             # Check if already in deal pipeline
             in_list, entry = check_org_in_list(org_id, AFFINITY_LIST_ID)
-            
+
             if in_list:
                 # Already in pipeline - get current stage, owner, and pass reason
                 stage = get_stage_name(org_id, AFFINITY_LIST_ID)
                 owners, pass_reasons = get_list_entry_details(org_id, AFFINITY_LIST_ID)
-                
+
                 message = f"*{org_name}* is already in the deal pipeline.\n📊 Current stage: *{stage}*"
-                
+
                 if owners:
                     message += f"\n👤 Owner: {', '.join(owners)}"
-                
+
                 if stage == "Passed" and pass_reasons:
                     message += f"\n❌ Pass reason: {', '.join(pass_reasons)}"
-                
+
                 return {
                     "status": "exists",
                     "company": org_name,
@@ -348,7 +689,7 @@ def process_company(search_term, domain=None, is_missed=False, slack_user_id=Non
             else:
                 # Org exists but not in pipeline - add it
                 list_entry = affinity.add_to_list(AFFINITY_LIST_ID, org_id)
-                
+
                 # Set owner if we have a slack user mapping
                 if slack_user_id and slack_user_id in SLACK_TO_AFFINITY_PERSON:
                     try:
@@ -357,11 +698,16 @@ def process_company(search_term, domain=None, is_missed=False, slack_user_id=Non
                         logger.info(f"Set owner to person {affinity_person_id}")
                     except Exception as e:
                         logger.error(f"Error setting owner: {e}")
-                
+
                 # If marked as missed, set the status
                 if is_missed:
                     try:
                         affinity.set_field_value(STATUS_FIELD_ID, org_id, list_entry["id"], MISSED_STATUS_VALUE_ID)
+                        if note:
+                            try:
+                                affinity.create_note(org_id, note)
+                            except Exception as e:
+                                logger.error(f"Error creating note: {e}")
                         return {
                             "status": "added",
                             "company": org_name,
@@ -369,7 +715,13 @@ def process_company(search_term, domain=None, is_missed=False, slack_user_id=Non
                         }
                     except Exception as e:
                         logger.error(f"Error setting missed status: {e}")
-                
+
+                if note:
+                    try:
+                        affinity.create_note(org_id, note)
+                    except Exception as e:
+                        logger.error(f"Error creating note: {e}")
+
                 return {
                     "status": "added",
                     "company": org_name,
@@ -382,9 +734,9 @@ def process_company(search_term, domain=None, is_missed=False, slack_user_id=Non
             org_id = new_org["id"]
             org_name = new_org["name"]
             logger.info(f"Created organization: {org_name} (ID: {org_id})")
-            
+
             list_entry = affinity.add_to_list(AFFINITY_LIST_ID, org_id)
-            
+
             # Set owner if we have a slack user mapping
             if slack_user_id and slack_user_id in SLACK_TO_AFFINITY_PERSON:
                 try:
@@ -393,11 +745,16 @@ def process_company(search_term, domain=None, is_missed=False, slack_user_id=Non
                     logger.info(f"Set owner to person {affinity_person_id}")
                 except Exception as e:
                     logger.error(f"Error setting owner: {e}")
-            
+
             # If marked as missed, set the status
             if is_missed:
                 try:
                     affinity.set_field_value(STATUS_FIELD_ID, org_id, list_entry["id"], MISSED_STATUS_VALUE_ID)
+                    if note:
+                        try:
+                            affinity.create_note(org_id, note)
+                        except Exception as e:
+                            logger.error(f"Error creating note: {e}")
                     return {
                         "status": "created",
                         "company": org_name,
@@ -405,13 +762,19 @@ def process_company(search_term, domain=None, is_missed=False, slack_user_id=Non
                     }
                 except Exception as e:
                     logger.error(f"Error setting missed status: {e}")
-            
+
+            if note:
+                try:
+                    affinity.create_note(org_id, note)
+                except Exception as e:
+                    logger.error(f"Error creating note: {e}")
+
             return {
                 "status": "created",
                 "company": org_name,
                 "message": f"✅ Created *{org_name}* and added to the deal pipeline as a new lead."
             }
-            
+
     except requests.exceptions.HTTPError as e:
         error_text = e.response.text if hasattr(e.response, 'text') else str(e)
         logger.error(f"Affinity API error: {error_text}")
@@ -435,7 +798,7 @@ def get_deals_needing_nudge():
         status_field_id = None
         owners_field_id = None
         status_options = {}
-        
+
         for field in fields:
             field_name = field.get("name", "").lower()
             if field_name in ["status", "stage"]:
@@ -444,29 +807,29 @@ def get_deals_needing_nudge():
                     status_options[option["id"]] = option["text"]
             elif field_name == "owners":
                 owners_field_id = field.get("id")
-        
+
         if not status_field_id:
             logger.error("Could not find Status field")
             return []
-        
+
         # Get all list entries
         list_entries = affinity.get_list_entries(AFFINITY_LIST_ID)
-        
+
         deals_to_nudge = []
         now = datetime.now(pytz.UTC)
-        
+
         for entry in list_entries:
             entity_id = entry.get("entity_id")
             list_entry_id = entry.get("id")
             created_at = entry.get("created_at")
-            
+
             # Get field values for this entry
             field_values = affinity.get_list_entry_field_values(list_entry_id)
-            
+
             current_status = None
             status_updated_at = None
             owners = []
-            
+
             for fv in field_values:
                 if fv.get("field_id") == status_field_id:
                     value = fv.get("value")
@@ -475,17 +838,17 @@ def get_deals_needing_nudge():
                     elif isinstance(value, int) and value in status_options:
                         current_status = status_options[value]
                     status_updated_at = fv.get("updated_at") or fv.get("created_at")
-                
+
                 elif fv.get("field_id") == owners_field_id:
                     # Owner field value is a person ID, need to resolve name
                     owner_value = fv.get("value")
                     if owner_value:
                         owners.append(owner_value)
-            
+
             # Check if this status needs a nudge
             if current_status and current_status in STAGE_THRESHOLDS:
                 threshold_days = STAGE_THRESHOLDS[current_status]
-                
+
                 # Parse the date when status was set
                 if status_updated_at:
                     try:
@@ -494,18 +857,18 @@ def get_deals_needing_nudge():
                         status_date = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
                 else:
                     status_date = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                
+
                 days_in_stage = (now - status_date).days
-                
+
                 if days_in_stage >= threshold_days:
                     # Get org details
                     try:
                         org = affinity.get_organization(entity_id)
                         org_name = org.get("name", "Unknown")
-                        
+
                         weeks_in_stage = days_in_stage // 7
                         week_text = f"{weeks_in_stage} week" + ("s" if weeks_in_stage != 1 else "")
-                        
+
                         deals_to_nudge.append({
                             "org_id": entity_id,
                             "org_name": org_name,
@@ -517,9 +880,9 @@ def get_deals_needing_nudge():
                         })
                     except Exception as e:
                         logger.error(f"Error getting org {entity_id}: {e}")
-        
+
         return deals_to_nudge
-        
+
     except Exception as e:
         logger.error(f"Error getting deals needing nudge: {e}")
         return []
@@ -541,27 +904,27 @@ def get_owner_name_from_id(person_id):
 def send_nudge_messages():
     """Check for deals needing nudges and send Slack messages."""
     logger.info("Running nudge check...")
-    
+
     if not NUDGE_CHANNEL_ID:
         logger.error("NUDGE_CHANNEL_ID not set")
         return
-    
+
     deals = get_deals_needing_nudge()
     logger.info(f"Found {len(deals)} deals needing nudges")
-    
+
     for deal in deals:
         # Determine who to tag
         slack_mention = ""
-        
+
         if deal["owners"]:
             # Get first owner's name and map to Slack ID
             owner_name = get_owner_name_from_id(deal["owners"][0])
             if owner_name and owner_name in OWNER_SLACK_MAP:
                 slack_id = OWNER_SLACK_MAP[owner_name]
                 slack_mention = f"<@{slack_id}> "
-        
+
         message = f"{slack_mention}{deal['org_name']} has been in \"{deal['status']}\" for {deal['week_text']}. Link: {deal['link']}"
-        
+
         try:
             app.client.chat_postMessage(
                 channel=NUDGE_CHANNEL_ID,
@@ -577,9 +940,9 @@ def run_scheduler():
     # Schedule nudge check at 9am PT on Tuesdays
     pacific = pytz.timezone('America/Los_Angeles')
     schedule.every().tuesday.at("09:00").do(send_nudge_messages)
-    
+
     logger.info("Scheduler started - nudges will run Tuesdays at 9am PT")
-    
+
     while True:
         schedule.run_pending()
         time.sleep(60)  # Check every minute
@@ -590,51 +953,179 @@ def handle_message(event, say, client):
     """Handle messages posted to #dealflow channel."""
     if event.get("subtype") in ["bot_message", "message_changed", "message_deleted"]:
         return
-    
+
     channel_id = event.get("channel")
     text = event.get("text", "").strip()
-    
+    ts = event.get("ts")
+    thread_ts = event.get("thread_ts") or ts
+
     # Check for manual nudge test command
     if text.lower() == "!nudge-test":
         say(text="🔄 Running nudge check...")
         send_nudge_messages()
         say(text="✅ Nudge check complete!")
         return
-    
+
     try:
         channel_info = client.conversations_info(channel=channel_id)
         channel_name = channel_info["channel"]["name"]
-        
+
         if channel_name != "dealflow":
             return
     except Exception as e:
         logger.error(f"Error getting channel info: {e}")
         return
-    
+
     if not text:
         return
-    
-    # Only process messages that contain a URL
-    url_pattern = r'https?://[^\s]+'
-    if not re.search(url_pattern, text):
-        return
-    
-    # Check if this is a "missed" deal BEFORE extracting company info
+
+    user_id = event.get("user")
+
+    # Check if this is a "missed" deal BEFORE branching
     missed_pattern = r'\b(missed|miss|missing)\b'
     is_missed = bool(re.search(missed_pattern, text.lower()))
-    logger.info(f"Processing message: {text} (is_missed: {is_missed})")
-    
-    company_name, domain = extract_company_info(text)
-    logger.info(f"Extracted - Name: {company_name}, Domain: {domain}")
-    
-    if not company_name and not domain:
+
+    # --- Branch 1: message contains a URL (existing flow) ---
+    url_pattern = r'https?://[^\s]+'
+    if re.search(url_pattern, text):
+        logger.info(f"Processing message with URL: {text} (is_missed: {is_missed})")
+
+        company_name, domain = extract_company_info(text)
+        logger.info(f"Extracted - Name: {company_name}, Domain: {domain}")
+
+        if not company_name and not domain:
+            return
+
+        result = process_company(company_name, domain, is_missed=is_missed, slack_user_id=user_id)
+        say(text=f"<@{user_id}> {result['message']}")
         return
-    
-    user_id = event.get("user")
-    
-    result = process_company(company_name, domain, is_missed=is_missed, slack_user_id=user_id)
-    
-    say(text=f"<@{user_id}> {result['message']}")
+
+    # --- Branch 2: no URL — run search + poll flow ---
+    seed = clean_seed_text(text)
+    if len(seed) < MIN_POLL_MESSAGE_LENGTH:
+        # Too short / probably a greeting — ignore
+        return
+
+    logger.info(f"No URL detected — launching URL search poll for seed='{seed}' (is_missed: {is_missed})")
+
+    # Post the poll in-thread under the original message
+    post_url_poll(
+        client=client,
+        channel=channel_id,
+        thread_ts=thread_ts,
+        poster_id=user_id,
+        seed_text=seed,
+        is_missed=is_missed,
+    )
+
+
+# ========================================
+# Poll button action handlers
+# ========================================
+
+@app.action(re.compile(r"^url_pick_\d+$"))
+def handle_url_pick(ack, body, client):
+    """User picked one of the candidate URLs from the poll."""
+    ack()
+    try:
+        clicker_id = body["user"]["id"]
+        channel_id = body["channel"]["id"]
+        message_ts = body["message"]["ts"]
+        action = body["actions"][0]
+        payload = json.loads(action["value"])
+
+        url = payload["url"]
+        poster_id = payload.get("poster_id")
+        is_missed = payload.get("is_missed", False)
+        seed = payload.get("seed", "")
+
+        # Extract domain from the URL
+        m = re.search(r"https?://(?:www\.)?([^/]+)", url)
+        domain = m.group(1) if m else url
+        # Use seed as company name fallback
+        company_name = payload.get("name") or seed or domain.split(".")[0].title()
+
+        # Owner = original poster (not the clicker)
+        result = process_company(
+            search_term=company_name,
+            domain=domain,
+            is_missed=is_missed,
+            slack_user_id=poster_id,
+        )
+
+        resolved = (
+            f"✅ <@{clicker_id}> picked *{domain}* for <@{poster_id}>'s post.\n"
+            f"{result['message']}"
+        )
+        disable_poll_message(client, channel_id, message_ts, resolved)
+    except Exception as e:
+        logger.error(f"Error in url_pick handler: {e}")
+        try:
+            client.chat_postMessage(
+                channel=body["channel"]["id"],
+                text=f"❌ Error processing that pick: {e}",
+            )
+        except Exception:
+            pass
+
+
+@app.action("url_stealth")
+def handle_url_stealth(ack, body, client):
+    """User marked the company as Stealth / no website."""
+    ack()
+    try:
+        clicker_id = body["user"]["id"]
+        channel_id = body["channel"]["id"]
+        message_ts = body["message"]["ts"]
+        payload = json.loads(body["actions"][0]["value"])
+
+        poster_id = payload.get("poster_id")
+        is_missed = payload.get("is_missed", False)
+        seed = payload.get("seed", "").strip()
+
+        if not seed:
+            disable_poll_message(
+                client, channel_id, message_ts,
+                "❌ Couldn't resolve as Stealth — no company name in the original message."
+            )
+            return
+
+        note = f"Stealth — no website. Marked by <@{clicker_id}> via dealflow-bot."
+        result = process_company(
+            search_term=seed,
+            domain=None,
+            is_missed=is_missed,
+            slack_user_id=poster_id,
+            note=note,
+        )
+
+        resolved = (
+            f"🕶️ <@{clicker_id}> marked *{seed}* as Stealth (no website) for <@{poster_id}>'s post.\n"
+            f"{result['message']}"
+        )
+        disable_poll_message(client, channel_id, message_ts, resolved)
+    except Exception as e:
+        logger.error(f"Error in url_stealth handler: {e}")
+
+
+@app.action("url_reply_later")
+def handle_url_reply_later(ack, body, client):
+    """User will reply in thread with the URL."""
+    ack()
+    try:
+        clicker_id = body["user"]["id"]
+        channel_id = body["channel"]["id"]
+        message_ts = body["message"]["ts"]
+        payload = json.loads(body["actions"][0]["value"])
+        poster_id = payload.get("poster_id")
+
+        resolved = (
+            f"📝 <@{clicker_id}> will reply with the URL for <@{poster_id}>'s post. "
+            f"No Affinity entry created yet — post the URL in-thread and I'll pick it up."
+        )
+        disable_poll_message(client, channel_id, message_ts, resolved)
+    except Exception as e:
+        logger.error(f"Error in url_reply_later handler: {e}")
 
 
 @app.event("app_mention")
@@ -650,7 +1141,7 @@ if __name__ == "__main__":
     # Start scheduler in background thread
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
-    
+
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     logger.info("Starting Slack bot with nudge scheduler...")
     handler.start()
