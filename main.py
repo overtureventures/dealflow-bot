@@ -142,6 +142,13 @@ EXCLUDED_DOMAINS = {
     "amazon.com", "amazon.co.uk", "etsy.com", "ebay.com", "walmart.com",
     "homedepot.com", "lowes.com", "target.com", "wayfair.com", "alibaba.com",
     "aliexpress.com", "shopify.com", "pinterest.com",
+    # More startup databases / VC trackers (supplements crunchbase/pitchbook)
+    "seedtable.com", "tracxn.com", "craft.co", "signalnfx.com", "specter.co",
+    "getlatka.com", "parsers.ai", "predictleads.com", "harmonic.ai",
+    "f6s.com", "angel.co", "angellist.com",
+    # VC-focused press / newsletters
+    "vctavern.com", "allocator.com", "strictlyvc.com", "termsheet.co",
+    "pitchbook.news", "dealflow.com", "fundersclub.com",
 }
 
 # Page-body keywords that mark a candidate as retail/product/non-company-homepage.
@@ -897,6 +904,19 @@ def rank_candidates(candidates, query=""):
     )
     date_path_re = re.compile(r"/20[12]\d/\d{1,2}/")  # /2024/03/, /2026/11/
 
+    # Funding-news slug fingerprints — URLs like
+    # /extellis-raises-6-8m-seed-round-to-launch-.../ have one long path segment
+    # that's clearly a news article. These patterns catch those even when the
+    # URL doesn't have an explicit /news/ or /press/ prefix.
+    funding_slug_re = re.compile(
+        r"-(?:raises|raised|announces?|launches?|unveils?|debuts?|closes?|emerges?|exits?|acquires?|"
+        r"acquired|secures?|wins?)-"
+        r"|-(?:seed|pre-seed|series-[a-f]\b|series[a-f]\b|round)-"
+        r"|-\d+\s*[-.]?\s*\d*\s*(?:m\b|bn?\b|million|billion)-"
+        r"|-(?:funding|investment|valuation|ipo|exit)-",
+        re.IGNORECASE,
+    )
+
     scored = []
     sector_hits_by_idx = {}
     retail_by_idx = {}
@@ -914,9 +934,9 @@ def rank_candidates(candidates, query=""):
                 name_boost = 1000
                 break
 
-        # URL-path penalty for news/blog/article paths
+        # URL-path penalty for news/blog/article paths and funding-news slugs
         path_penalty = 0
-        if article_path_re.search(url) or date_path_re.search(url):
+        if article_path_re.search(url) or date_path_re.search(url) or funding_slug_re.search(url):
             path_penalty = 500
 
         # Score content: sector keyword hits vs. retail signals
@@ -1172,11 +1192,41 @@ def post_url_poll(client, channel, thread_ts, poster_id, seed_text, is_missed, l
         host_segs = re.split(r"[^a-z0-9]+", host)
         return any(any(t == seg or t in seg for seg in host_segs) for t in name_tokens)
 
-    # Domain-guess fallback fires when Brave returned no results OR when none of
-    # its results contain the company name in the hostname (common for seed-stage
-    # companies whose sites aren't well-indexed).
+    def _has_penalty_path(url):
+        """True if the URL path smells like a news article / press release /
+        funding announcement / date-stamped article."""
+        # Import the patterns built in rank_candidates. Rebuild here to avoid
+        # exporting them at module level just for this callsite.
+        _news_words = r"(?:news|press|article|articles|story|stories|blog|posts?|media|newsroom|announcements?|insights|coverage|releases?)"
+        if re.search(rf"/[^/]*\b{_news_words}\b[^/]*/", url, re.IGNORECASE):
+            return True
+        if re.search(r"/20[12]\d/\d{1,2}/", url):
+            return True
+        if re.search(
+            r"-(?:raises|raised|announces?|launches?|unveils?|debuts?|closes?|secures?|acquires?|acquired|wins?)-"
+            r"|-(?:seed|pre-seed|series-[a-f]\b|series[a-f]\b|round)-"
+            r"|-\d+\s*[-.]?\s*\d*\s*(?:m\b|bn?\b|million|billion)-"
+            r"|-(?:funding|investment|valuation|ipo|exit)-",
+            url, re.IGNORECASE
+        ):
+            return True
+        return False
+
+    # Domain-guess fallback fires when:
+    #   - Brave returned no results, OR
+    #   - No candidate has the name in the hostname, OR
+    #   - All hostname-matching candidates have penalty paths (e.g., extellis.com
+    #     was only returned as extellis.com/press/seed-round-announcement — we
+    #     should still probe extellis.com/ directly so the ranker can prefer the
+    #     homepage over the press sub-page).
+    hostname_matches = [c for c in candidates if _hostname_contains_name(c["url"])]
+    hostname_matches_without_penalty = [
+        c for c in hostname_matches if not _has_penalty_path(c["url"])
+    ]
     needs_guess = name_tokens and (
-        not candidates or not any(_hostname_contains_name(c["url"]) for c in candidates)
+        not candidates
+        or not hostname_matches
+        or not hostname_matches_without_penalty
     )
     if needs_guess:
         logger.info(
