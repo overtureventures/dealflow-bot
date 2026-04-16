@@ -655,7 +655,7 @@ def search_urls_with_brave(seed_text, max_candidates=3):
         }
         params = {
             "q": brave_query,
-            "count": 10,          # fetch 10, filter down to top candidates
+            "count": 20,          # fetch 20, filter down to top candidates (widens pool for seed-stage cos)
             "safesearch": "off",
             "result_filter": "web",
             "country": "us",
@@ -718,8 +718,9 @@ def search_urls_with_brave(seed_text, max_candidates=3):
                 "name": re.sub(r"<[^>]+>", "", title).strip() or domain.split(".")[0].title(),
                 "why": why,
             })
-            # Keep up to 5 raw candidates; rank_candidates() narrows to top 3 using the keyword scorer
-            if len(cleaned) >= max(5, max_candidates):
+            # Keep up to 10 raw candidates; rank_candidates() narrows to top 3 using the scorer.
+            # Wider pool means the ranker has more material to find the real homepage among news.
+            if len(cleaned) >= max(10, max_candidates):
                 break
 
         return {"candidates": cleaned, "error": None, "raw": raw}
@@ -810,8 +811,13 @@ def rank_candidates(candidates, query=""):
     """
     name_tokens = _name_tokens_for_match(query)
 
+    # Match any URL path segment that contains a news/article/blog word with word
+    # boundaries. Catches "/news/", "/startup-news/", "/press-releases/",
+    # "/news-and-events/", "/media-coverage/", etc. without false-matching
+    # "/blogger/" or "/products/".
+    _news_words = r"(?:news|press|article|articles|story|stories|blog|posts?|media|newsroom|announcements?|insights|coverage|releases?)"
     article_path_re = re.compile(
-        r"/(news|press|press-release|press-releases|article|articles|story|stories|blog|p|posts|post|media|newsroom|announcements?)/",
+        rf"/[^/]*\b{_news_words}\b[^/]*/",
         re.IGNORECASE,
     )
     date_path_re = re.compile(r"/20[12]\d/\d{1,2}/")  # /2024/03/, /2026/11/
@@ -843,6 +849,90 @@ def rank_candidates(candidates, query=""):
 
     scored.sort(reverse=True)
     return [c for _, _, c in scored]
+
+
+def guess_company_domains(query, timeout=5):
+    """
+    Probe plausible domain patterns for a company name and return any that
+    resolve with the name appearing in the homepage text.
+
+    Called as a fallback when Brave's top results don't include any hostname
+    containing the company name — common for seed-stage companies whose sites
+    aren't well-indexed yet.
+
+    Returns a list of candidate dicts in the same shape as search_urls_with_brave.
+    """
+    tokens = _name_tokens_for_match(query)
+    if not tokens:
+        return []
+    # Use only the first meaningful token for the domain guess. For a query like
+    # "Extellis" -> "extellis". For "DeepWeave AI" -> "deepweave".
+    name = tokens[0]
+
+    tlds = [".com", ".ai", ".io", ".co", ".xyz", ".tech", ".net"]
+    prefixes = ["", "get", "join", "use", "try", "hello", "meet"]
+    suffixes = ["", "hq", "app", "labs", "co"]
+
+    guesses = []
+    seen = set()
+    for prefix in prefixes:
+        for suffix in suffixes:
+            stem = f"{prefix}{name}{suffix}"
+            for tld in tlds:
+                host = f"{stem}{tld}"
+                if host in seen:
+                    continue
+                seen.add(host)
+                guesses.append(host)
+
+    # Cap probes so we don't hammer DNS / take forever. Prefer the simpler
+    # patterns (no prefix/suffix, shorter TLDs) — they're listed first above.
+    guesses = guesses[:20]
+
+    logger.info(f"Domain-guess fallback probing {len(guesses)} patterns for '{name}'")
+
+    found = []
+    headers = {"User-Agent": "Mozilla/5.0 (Overture dealflow-bot)"}
+    name_lower = name.lower()
+
+    for host in guesses:
+        if any(ex in host for ex in EXCLUDED_DOMAINS):
+            continue
+        url = f"https://{host}/"
+        try:
+            r = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True)
+            if not r.ok:
+                continue
+            # Check that the final URL isn't a parked-domain/registrar page
+            final_host = ""
+            mm = re.search(r"https?://(?:www\.)?([^/]+)", r.url or "")
+            if mm:
+                final_host = mm.group(1).lower()
+            if any(ex in final_host for ex in EXCLUDED_DOMAINS):
+                continue
+            # Strip HTML, check the name appears in the page body
+            body = r.text or ""
+            body = re.sub(r"<script.*?</script>", " ", body, flags=re.DOTALL | re.IGNORECASE)
+            body = re.sub(r"<style.*?</style>", " ", body, flags=re.DOTALL | re.IGNORECASE)
+            body = re.sub(r"<[^>]+>", " ", body)
+            body_lower = body.lower()
+            if name_lower not in body_lower:
+                continue
+            # Grab a rough description: first ~180 chars of visible text
+            cleaned_body = re.sub(r"\s+", " ", body).strip()
+            why = cleaned_body[:180]
+            found.append({
+                "url": r.url or url,
+                "name": query,
+                "why": why,
+            })
+            logger.info(f"Domain-guess HIT: {host} -> {r.url}")
+        except Exception as e:
+            # Silent fail on individual probes — most won't resolve, that's expected
+            logger.debug(f"Domain-guess miss: {host} ({e})")
+            continue
+
+    return found
 
 
 def build_poll_blocks(seed_text, candidates, poster_id, is_missed, linkedin_url=None):
@@ -940,6 +1030,38 @@ def post_url_poll(client, channel, thread_ts, poster_id, seed_text, is_missed, l
     # Build a display name: the focused query (first line / truncated)
     display_query, _ = _split_query_and_context(seed_text)
     display_name = display_query or seed_text[:80]
+    query_for_rank = display_query or seed_text
+    name_tokens = _name_tokens_for_match(query_for_rank)
+
+    def _hostname_contains_name(url):
+        m = re.search(r"https?://(?:www\.)?([^/]+)", url)
+        host = (m.group(1) if m else "").lower()
+        host_segs = re.split(r"[^a-z0-9]+", host)
+        return any(any(t == seg or t in seg for seg in host_segs) for t in name_tokens)
+
+    # Domain-guess fallback fires when Brave returned no results OR when none of
+    # its results contain the company name in the hostname (common for seed-stage
+    # companies whose sites aren't well-indexed).
+    needs_guess = name_tokens and (
+        not candidates or not any(_hostname_contains_name(c["url"]) for c in candidates)
+    )
+    if needs_guess:
+        logger.info(
+            f"No Brave candidate hostname contains '{name_tokens[0]}' — "
+            f"running domain-guess fallback"
+        )
+        guessed = guess_company_domains(query_for_rank)
+        if guessed:
+            # Dedupe by domain against existing candidates
+            existing_domains = set()
+            for c in candidates:
+                m = re.search(r"https?://(?:www\.)?([^/]+)", c["url"])
+                if m:
+                    existing_domains.add(m.group(1).lower())
+            for g in guessed:
+                m = re.search(r"https?://(?:www\.)?([^/]+)", g["url"])
+                if m and m.group(1).lower() not in existing_domains:
+                    candidates.append(g)
 
     if not candidates:
         if err:
@@ -965,7 +1087,7 @@ def post_url_poll(client, channel, thread_ts, poster_id, seed_text, is_missed, l
 
     # Cap to top 3 after ranking. Pass the query so the ranker can boost
     # domains that match the company name over news/PR articles that merely mention it.
-    candidates = rank_candidates(candidates, query=display_query or seed_text)[:3]
+    candidates = rank_candidates(candidates, query=query_for_rank)[:3]
 
     blocks = build_poll_blocks(display_name, candidates, poster_id, is_missed, linkedin_url=linkedin_url)
     client.chat_postMessage(
