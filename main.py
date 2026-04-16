@@ -97,11 +97,42 @@ KEYWORDS = {
 
 # Domains to exclude from URL search candidates — these are never the "real" company site
 EXCLUDED_DOMAINS = {
-    "linkedin.com", "crunchbase.com", "pitchbook.com", "wikipedia.org",
-    "twitter.com", "x.com", "facebook.com", "instagram.com", "youtube.com",
-    "medium.com", "substack.com", "techcrunch.com", "forbes.com", "bloomberg.com",
-    "reuters.com", "wsj.com", "ft.com", "nytimes.com", "axios.com",
-    "bing.com", "google.com", "duckduckgo.com",
+    # Social / pro networks
+    "linkedin.com", "twitter.com", "x.com", "facebook.com", "instagram.com",
+    "youtube.com", "tiktok.com", "threads.net", "mastodon.social", "bsky.app",
+    # Directories / data providers (competitors of the CRM view, not actual company sites)
+    "crunchbase.com", "pitchbook.com", "cbinsights.com", "zoominfo.com",
+    "rocketreach.co", "dnb.com", "growjo.com", "owler.com", "ventureradar.com",
+    "apollo.io", "lusha.com", "signalhire.com", "clearbit.com",
+    # Job boards / company review sites
+    "glassdoor.com", "indeed.com", "monster.com", "ziprecruiter.com",
+    # Reference / encyclopedia
+    "wikipedia.org", "wikidata.org",
+    # PR wires
+    "prnewswire.com", "globenewswire.com", "businesswire.com", "accesswire.com",
+    "prweb.com", "einnews.com", "einpresswire.com", "newswire.com", "prlog.org",
+    # Financial news / data
+    "bloomberg.com", "reuters.com", "marketwatch.com", "seekingalpha.com",
+    "yahoo.com", "finance.yahoo.com", "cnbc.com", "fool.com", "morningstar.com",
+    "wsj.com", "ft.com", "barrons.com", "investors.com",
+    # General news
+    "nytimes.com", "washingtonpost.com", "apnews.com", "cnn.com", "nbcnews.com",
+    "foxnews.com", "npr.org", "bbc.com", "bbc.co.uk", "theguardian.com",
+    "usatoday.com", "axios.com", "politico.com", "reuters.co.uk",
+    # Tech / business press
+    "techcrunch.com", "forbes.com", "fortune.com", "businessinsider.com",
+    "venturebeat.com", "theverge.com", "wired.com", "fastcompany.com",
+    "zdnet.com", "arstechnica.com", "engadget.com", "theinformation.com",
+    "cio.com", "computerworld.com", "inc.com", "entrepreneur.com",
+    "protocol.com", "theregister.com", "digitaltrends.com", "gizmodo.com",
+    # Content / community platforms (not companies)
+    "medium.com", "substack.com", "reddit.com", "ycombinator.com",
+    "news.ycombinator.com", "producthunt.com", "quora.com", "stackexchange.com",
+    "stackoverflow.com", "github.com", "gitlab.com",
+    # Search engines
+    "bing.com", "google.com", "duckduckgo.com", "brave.com",
+    # App stores
+    "apps.apple.com", "play.google.com",
 }
 
 # Minimum characters in a no-URL message before we trigger the URL-search poll
@@ -736,12 +767,80 @@ def score_candidate(url):
     return total, sector_hits
 
 
-def rank_candidates(candidates):
-    """Score each candidate and sort by descending match. Preserves input order on ties."""
+_NAME_STOPWORDS = {
+    "ai", "io", "labs", "lab", "inc", "llc", "ltd", "co", "corp", "corporation",
+    "company", "technologies", "technology", "tech", "systems", "solutions",
+    "group", "the", "and",
+}
+
+
+def _name_tokens_for_match(query):
+    """Extract meaningful name tokens from the query for domain-match scoring.
+
+    Lowercased alphanumeric tokens, with common company suffixes dropped. Tokens
+    shorter than 3 chars are skipped to avoid false positives (e.g. "ai" matching
+    half the internet).
+    """
+    if not query:
+        return []
+    q = query.lower()
+    # Split on non-alphanumeric
+    tokens = re.split(r"[^a-z0-9]+", q)
+    out = []
+    for t in tokens:
+        if len(t) < 3:
+            continue
+        if t in _NAME_STOPWORDS:
+            continue
+        out.append(t)
+    return out
+
+
+def rank_candidates(candidates, query=""):
+    """Score each candidate and sort by descending match.
+
+    Ranking combines:
+      - keyword-match score from the candidate page content (sector fit)
+      - a large boost when the company name appears in the candidate's hostname
+        (this is what keeps news / PR articles about the company from out-ranking
+        the company's actual homepage)
+      - a small penalty for URL paths that look like news articles or blog posts
+
+    Ties preserve input order (Brave's own ranking).
+    """
+    name_tokens = _name_tokens_for_match(query)
+
+    article_path_re = re.compile(
+        r"/(news|press|press-release|press-releases|article|articles|story|stories|blog|p|posts|post|media|newsroom|announcements?)/",
+        re.IGNORECASE,
+    )
+    date_path_re = re.compile(r"/20[12]\d/\d{1,2}/")  # /2024/03/, /2026/11/
+
     scored = []
     for idx, c in enumerate(candidates):
-        total, sectors = score_candidate(c["url"])
-        scored.append((total, -idx, c))
+        url = c["url"]
+        m = re.search(r"https?://(?:www\.)?([^/]+)", url)
+        hostname = (m.group(1) if m else url).lower()
+        # Drop TLD suffixes for matching (e.g. extellis.com → extellis)
+        hostname_core = re.split(r"[^a-z0-9]+", hostname)
+
+        # Name-match boost: +1000 if any meaningful name token appears in the hostname
+        name_boost = 0
+        for t in name_tokens:
+            if any(t == seg or t in seg for seg in hostname_core):
+                name_boost = 1000
+                break
+
+        # URL-path penalty for news/blog/article paths
+        path_penalty = 0
+        if article_path_re.search(url) or date_path_re.search(url):
+            path_penalty = 500
+
+        total_keyword, _sectors = score_candidate(url)
+
+        final_score = name_boost + total_keyword - path_penalty
+        scored.append((final_score, -idx, c))
+
     scored.sort(reverse=True)
     return [c for _, _, c in scored]
 
@@ -864,8 +963,9 @@ def post_url_poll(client, channel, thread_ts, poster_id, seed_text, is_missed, l
         )
         return
 
-    # Cap to top 3 after ranking
-    candidates = rank_candidates(candidates)[:3]
+    # Cap to top 3 after ranking. Pass the query so the ranker can boost
+    # domains that match the company name over news/PR articles that merely mention it.
+    candidates = rank_candidates(candidates, query=display_query or seed_text)[:3]
 
     blocks = build_poll_blocks(display_name, candidates, poster_id, is_missed, linkedin_url=linkedin_url)
     client.chat_postMessage(
