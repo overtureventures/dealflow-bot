@@ -19,7 +19,7 @@ SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
 AFFINITY_API_KEY = os.environ.get("AFFINITY_API_KEY")
 AFFINITY_LIST_ID = os.environ.get("AFFINITY_LIST_ID")
 NUDGE_CHANNEL_ID = os.environ.get("NUDGE_CHANNEL_ID")  # #deal-nudges channel ID
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+BRAVE_SEARCH_API_KEY = os.environ.get("BRAVE_SEARCH_API_KEY")
 
 # Owner name to Slack ID mapping
 OWNER_SLACK_MAP = {
@@ -512,7 +512,7 @@ def _split_query_and_context(seed_text, query_max=120, context_max=1500):
 
     The first line (or first ~80 chars ending at a word boundary) becomes the query.
     The full seed (up to context_max) is passed as context so the model knows sectors,
-    founders, etc. Keeps the OpenAI web-search tool targeted.
+    founders, etc. Keeps the web-search query targeted.
     """
     seed_text = (seed_text or "").strip()
     if not seed_text:
@@ -584,97 +584,109 @@ def _extract_json_array(raw):
     return None, "no JSON array found in response"
 
 
-def search_urls_with_openai(seed_text, max_candidates=3):
+def search_urls_with_brave(seed_text, max_candidates=3):
     """
-    Use OpenAI web search to find candidate company URLs for a given seed.
+    Use Brave Search API to find candidate company URLs for a given seed.
     Returns a dict: {"candidates": list, "error": str|None, "raw": str}
     """
-    if not OPENAI_API_KEY:
-        logger.error("OPENAI_API_KEY not set — cannot run URL search")
-        return {"candidates": [], "error": "OPENAI_API_KEY not configured", "raw": ""}
+    if not BRAVE_SEARCH_API_KEY:
+        logger.error("BRAVE_SEARCH_API_KEY not set — cannot run URL search")
+        return {"candidates": [], "error": "BRAVE_SEARCH_API_KEY not configured", "raw": ""}
 
     query, context = _split_query_and_context(seed_text)
     if not query:
         return {"candidates": [], "error": "empty query", "raw": ""}
 
-    sector_list = ", ".join(KEYWORDS.keys())
-    excluded = ", ".join(sorted(EXCLUDED_DOMAINS))
-
-    prompt = (
-        f"You are helping a VC firm (Overture Ventures) identify a company's official website.\n"
-        f"Overture invests in: {sector_list} (energy, AI, industrial transformation, resilience).\n\n"
-        f"COMPANY NAME / HINT: {query}\n\n"
-        f"ADDITIONAL CONTEXT:\n{context}\n\n"
-        f"Find up to {max_candidates} candidate official company websites that best match. "
-        f"Prefer companies whose work aligns with Overture's sectors.\n\n"
-        f"Rules:\n"
-        f"- Return ONLY official company websites, not news articles, social profiles, directories, or aggregators.\n"
-        f"- Never return any of these domains: {excluded}.\n"
-        f"- If you cannot find plausible candidates, return an empty array [].\n"
-        f"- Respond with ONLY a JSON array. Each element must be an object with exactly these keys: "
-        f"\"url\" (string), \"name\" (string), \"why\" (short string, max 120 chars).\n"
-        f"- No prose, no markdown, no code fences, no citations in the output."
-    )
-
     raw = ""
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        logger.info(f"Brave web search — query='{query}' (context {len(context)} chars)")
 
-        logger.info(f"OpenAI web search — query='{query}' (context {len(context)} chars)")
+        # Brave prefers short, focused queries. We pass the truncated query only.
+        # Append a couple of domain hints to bias toward company homepages.
+        brave_query = query
+        if len(brave_query) > 400:
+            brave_query = brave_query[:400]
 
-        response = client.responses.create(
-            model="gpt-4o",
-            tools=[{"type": "web_search_preview"}],
-            input=prompt,
-        )
+        url = "https://api.search.brave.com/res/v1/web/search"
+        headers = {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": BRAVE_SEARCH_API_KEY,
+        }
+        params = {
+            "q": brave_query,
+            "count": 10,          # fetch 10, filter down to top candidates
+            "safesearch": "off",
+            "result_filter": "web",
+            "country": "us",
+        }
 
-        # Grab the output text
-        raw = getattr(response, "output_text", None) or ""
-        if not raw:
-            # Fallback: walk the output list
-            for item in getattr(response, "output", []) or []:
-                if getattr(item, "type", None) == "message":
-                    for c in getattr(item, "content", []) or []:
-                        if getattr(c, "type", None) in ("output_text", "text"):
-                            raw += getattr(c, "text", "") or ""
+        # Up to 2 attempts to handle the 1 req/sec rate limit
+        last_err = None
+        response = None
+        for attempt in range(2):
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=10)
+                if response.status_code == 429:
+                    last_err = "rate_limited (429)"
+                    time.sleep(1.2)
+                    continue
+                if not response.ok:
+                    last_err = f"HTTP {response.status_code}: {response.text[:200]}"
+                    break
+                break
+            except Exception as e:
+                last_err = f"request exception: {e}"
+                time.sleep(1.2)
 
-        logger.info(f"OpenAI raw response ({len(raw)} chars): {raw[:800]}")
+        if response is None or not response.ok:
+            return {"candidates": [], "error": f"Brave call failed: {last_err}", "raw": ""}
 
-        if not raw:
-            return {"candidates": [], "error": "OpenAI returned empty response", "raw": ""}
+        raw = response.text or ""
+        logger.info(f"Brave raw response ({len(raw)} chars): {raw[:800]}")
 
-        candidates, parse_err = _extract_json_array(raw)
-        if candidates is None:
-            return {"candidates": [], "error": f"could not parse JSON ({parse_err})", "raw": raw}
+        try:
+            data = response.json()
+        except Exception as e:
+            return {"candidates": [], "error": f"could not parse Brave JSON ({e})", "raw": raw}
 
-        # Filter excluded domains and dedupe by domain
+        web_results = (data.get("web") or {}).get("results") or []
+        if not web_results:
+            return {"candidates": [], "error": None, "raw": raw}
+
+        # Filter excluded domains and dedupe by domain; preserve Brave's ranking
         cleaned = []
         seen_domains = set()
-        for c in candidates:
-            url = c.get("url") if isinstance(c, dict) else None
-            if not url or not isinstance(url, str):
+        for r in web_results:
+            result_url = r.get("url") if isinstance(r, dict) else None
+            if not result_url or not isinstance(result_url, str):
                 continue
-            m = re.search(r"https?://(?:www\.)?([^/]+)", url)
-            domain = m.group(1).lower() if m else url.lower()
+            m = re.search(r"https?://(?:www\.)?([^/]+)", result_url)
+            domain = m.group(1).lower() if m else result_url.lower()
             if any(ex in domain for ex in EXCLUDED_DOMAINS):
                 continue
             if domain in seen_domains:
                 continue
             seen_domains.add(domain)
+            title = r.get("title") or ""
+            description = r.get("description") or ""
+            why = (description or title).strip()
+            # strip HTML bold tags Brave sometimes includes
+            why = re.sub(r"<[^>]+>", "", why)[:200]
             cleaned.append({
-                "url": url,
-                "name": c.get("name") or domain.split(".")[0].title(),
-                "why": (c.get("why") or "")[:200],
+                "url": result_url,
+                "name": re.sub(r"<[^>]+>", "", title).strip() or domain.split(".")[0].title(),
+                "why": why,
             })
-            if len(cleaned) >= max_candidates:
+            # Keep up to 5 raw candidates; rank_candidates() narrows to top 3 using the keyword scorer
+            if len(cleaned) >= max(5, max_candidates):
                 break
 
         return {"candidates": cleaned, "error": None, "raw": raw}
 
     except Exception as e:
-        logger.error(f"OpenAI URL search failed: {e}")
-        return {"candidates": [], "error": f"OpenAI call failed: {e}", "raw": raw}
+        logger.error(f"Brave URL search failed: {e}")
+        return {"candidates": [], "error": f"Brave call failed: {e}", "raw": raw}
 
 
 def fetch_page_text(url, timeout=8):
@@ -806,7 +818,7 @@ def post_url_poll(client, channel, thread_ts, poster_id, seed_text, is_missed, l
     """Search for candidates and post the poll in-thread."""
     logger.info(f"Running URL search poll for seed='{seed_text[:120]}' (linkedin={linkedin_url})")
 
-    result = search_urls_with_openai(seed_text, max_candidates=3)
+    result = search_urls_with_brave(seed_text, max_candidates=3)
     candidates = result["candidates"]
     err = result["error"]
 
