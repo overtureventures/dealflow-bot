@@ -1,4 +1,4 @@
-# Build marker: 2026-04-17T00-39 (bust Docker layer cache for extellis-v4)
+# Build marker: 2026-04-17T01-00 (bust Docker layer cache for v6)
 slack-bolt==1.18.1
 requests==2.31.0
 schedule==1.2.1
