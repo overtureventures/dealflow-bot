@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # Version marker — bumps with each code change so Railway logs prove which
 # build is running. Grep Railway logs for "[VERSION]" to see the line below.
-BOT_VERSION = "2026-04-17T00-50-extellis-v5 (stealth parens format, Write-in-URL modal input)"
+BOT_VERSION = "2026-04-17T01-00-v6 (ignore team announcements / meta-discussion in channel)"
 logger.info(f"[VERSION] {BOT_VERSION}")
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
@@ -391,6 +391,52 @@ def strip_urls(text):
     text = re.sub(r'https?://\S+', '', text)
     text = re.sub(r'\b[a-zA-Z0-9-]+\.(?:com|io|co|ai|org|net|app|vc|xyz|tech|dev)\S*', '', text)
     return text.strip()
+
+
+# Patterns that mark a message as a team announcement or in-channel discussion
+# rather than a company submission. Any one match → the bot silently ignores.
+_ANNOUNCEMENT_STARTER_RE = re.compile(
+    r"^\s*(?:team[,:\s\-]|hey\s+team|hi\s+team|folks\b|hey\s+folks|fyi\b|heads?\s+up\b|"
+    r"quick\s+note|quick\s+update|reminder[,:]?\s|pro\s+tip|update[,:])",
+    re.IGNORECASE,
+)
+
+# Newline followed by a list marker: "1.", "1)", "- ", "* "
+_LIST_MARKER_RE = re.compile(r"\n\s*(?:\d+[\.\)]|[-*])\s+")
+
+# Meta references to the bot itself or directive "see above/below" phrases
+_META_REF_RE = re.compile(
+    r"\b(?:this\s+bot|the\s+bot|this\s+app|the\s+(?:affinity\s+)?dealflow\s+bot|"
+    r"made\s+(?:some\s+)?improvements?|see\s+(?:examples?\s+)?(?:above|below))\b",
+    re.IGNORECASE,
+)
+
+
+def _is_team_announcement(text):
+    """Return True if the message looks like a team announcement / discussion
+    rather than a company lead. Used to silently skip bot processing.
+
+    Signals (any one triggers ignore):
+      1. Starts with a team-direction phrase ("Team -", "Hey team", "FYI", etc.)
+         — but only if the message has 5+ words, so bare "Team Ventures" passes.
+      2. Contains a numbered or bulleted list on a new line.
+      3. Contains meta references to the bot itself or "see above/below".
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    word_count = len(stripped.split())
+
+    if word_count >= 5 and _ANNOUNCEMENT_STARTER_RE.search(stripped):
+        return True
+    if _LIST_MARKER_RE.search(stripped):
+        return True
+    if _META_REF_RE.search(stripped):
+        return True
+    return False
 
 
 def clean_seed_text(text):
@@ -1881,6 +1927,13 @@ def handle_message(event, say, client):
         return
 
     if not text:
+        return
+
+    # Skip team announcements, in-channel discussion, meta-references to the bot.
+    # These aren't company leads — e.g., "Team - made some improvements to this bot",
+    # "FYI, here are the changes", "See examples above", numbered/bulleted lists.
+    if _is_team_announcement(text):
+        logger.info(f"Ignoring team announcement/discussion: {text[:80]}...")
         return
 
     user_id = event.get("user")
