@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # Version marker — bumps with each code change so Railway logs prove which
 # build is running. Grep Railway logs for "[VERSION]" to see the line below.
-BOT_VERSION = "2026-04-16-extellis-v2 (seedtable+vctavern blocked, funding-slug penalty, smarter guess trigger)"
+BOT_VERSION = "2026-04-16-extellis-v3 (auto-promote homepage roots, VC-firm page penalty)"
 logger.info(f"[VERSION] {BOT_VERSION}")
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
@@ -163,6 +163,18 @@ RETAIL_KEYWORDS = {
     "in stock", "out of stock", "shipping & returns", "add to wishlist",
     "product details", "product description", "quantity", "sku:",
     "customer reviews", "star rating", "checkout", "delivery to",
+}
+
+# Page-body keywords that mark a candidate as a VC firm / investor page rather
+# than an operating company. Used to penalize investor sites that sneak in via
+# name fuzzy-match (e.g. "Xtellus Capital" showing up for "Extellis").
+VC_FIRM_KEYWORDS = {
+    "portfolio company", "portfolio companies", "our portfolio",
+    "invests in", "we invest in", "invested in", "our investments",
+    "general partner", "managing partner", "limited partner",
+    "limited partners", "fund size", "fund iv", "fund v", "fund vi",
+    "venture fund", "venture capital firm", "vc firm",
+    "early-stage venture", "seed-stage venture",
 }
 
 # Minimum characters in a no-URL message before we trigger the URL-search poll
@@ -944,7 +956,7 @@ def rank_candidates(candidates, query=""):
         if article_path_re.search(url) or date_path_re.search(url) or funding_slug_re.search(url):
             path_penalty = 500
 
-        # Score content: sector keyword hits vs. retail signals
+        # Score content: sector keyword hits vs. retail + VC-firm signals
         page_text = fetch_page_text(url)
         sector_total = 0
         if page_text:
@@ -953,6 +965,7 @@ def rank_candidates(candidates, query=""):
                     if w in page_text:
                         sector_total += 1
         retail_hits = sum(1 for k in RETAIL_KEYWORDS if k in (page_text or ""))
+        vc_hits = sum(1 for k in VC_FIRM_KEYWORDS if k in (page_text or ""))
 
         sector_hits_by_idx[idx] = sector_total
         retail_by_idx[idx] = retail_hits
@@ -963,7 +976,15 @@ def rank_candidates(candidates, query=""):
         elif retail_hits >= 1:
             retail_penalty = 150
 
-        final_score = name_boost + sector_total - path_penalty - retail_penalty
+        # VC-firm penalty: investor pages describing their portfolio shouldn't
+        # out-rank operating companies, even if they mention the company name.
+        vc_penalty = 0
+        if vc_hits >= 3:
+            vc_penalty = 300
+        elif vc_hits >= 1:
+            vc_penalty = 100
+
+        final_score = name_boost + sector_total - path_penalty - retail_penalty - vc_penalty
         scored.append((final_score, -idx, c))
 
     scored.sort(reverse=True)
@@ -1217,21 +1238,49 @@ def post_url_poll(client, channel, thread_ts, poster_id, seed_text, is_missed, l
             return True
         return False
 
-    # Domain-guess fallback fires when:
-    #   - Brave returned no results, OR
-    #   - No candidate has the name in the hostname, OR
-    #   - All hostname-matching candidates have penalty paths (e.g., extellis.com
-    #     was only returned as extellis.com/press/seed-round-announcement — we
-    #     should still probe extellis.com/ directly so the ranker can prefer the
-    #     homepage over the press sub-page).
     hostname_matches = [c for c in candidates if _hostname_contains_name(c["url"])]
     hostname_matches_without_penalty = [
         c for c in hostname_matches if not _has_penalty_path(c["url"])
     ]
+
+    # Auto-promote: for any hostname-matching candidate that has a penalty path
+    # (e.g., extellis.com/press/seed-round-announcement), synthesize the root URL
+    # of that hostname and add it as a sibling candidate. No HTTP verification —
+    # the ranker's fetch_page_text will do its own fetch during scoring. The
+    # homepage wins naturally because it has no path penalty.
+    existing_urls = {c["url"] for c in candidates}
+    for c in list(hostname_matches):
+        if not _has_penalty_path(c["url"]):
+            continue
+        m = re.search(r"(https?://[^/]+)", c["url"])
+        if not m:
+            continue
+        root = m.group(1) + "/"
+        if root in existing_urls:
+            continue
+        # Extract the hostname for display
+        mh = re.search(r"https?://(?:www\.)?([^/]+)", root)
+        root_hostname = mh.group(1) if mh else root
+        candidates.append({
+            "url": root,
+            "name": root_hostname.split(".")[0].title(),
+            "why": "",
+        })
+        existing_urls.add(root)
+        logger.info(f"Auto-promoted homepage root: {root} (from penalty-path candidate {c['url']})")
+
+    # Refresh the hostname-match sets now that we've added roots
+    hostname_matches = [c for c in candidates if _hostname_contains_name(c["url"])]
+    hostname_matches_without_penalty = [
+        c for c in hostname_matches if not _has_penalty_path(c["url"])
+    ]
+
+    # Domain-guess fallback still fires when Brave returned nothing usable OR
+    # there's no hostname match at all — the auto-promote above handles the
+    # penalty-path-only case.
     needs_guess = name_tokens and (
         not candidates
         or not hostname_matches
-        or not hostname_matches_without_penalty
     )
     if needs_guess:
         logger.info(
