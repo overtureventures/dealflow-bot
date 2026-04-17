@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # Version marker — bumps with each code change so Railway logs prove which
 # build is running. Grep Railway logs for "[VERSION]" to see the line below.
-BOT_VERSION = "2026-04-17T00-39-extellis-v4 (auto-promote homepage roots, VC-firm page penalty — fresh paste)"
+BOT_VERSION = "2026-04-17T00-50-extellis-v5 (stealth parens format, Write-in-URL modal input)"
 logger.info(f"[VERSION] {BOT_VERSION}")
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
@@ -521,9 +521,12 @@ def process_linkedin_person(linkedin_info, poster_id, client, channel_id, thread
         f"Stealth — placeholder from LinkedIn profile. "
         f"LinkedIn: {url} (shared by <@{poster_id}> via dealflow-bot)"
     )
+    # Use "Name (Stealth)" format in Affinity so the placeholder entries are
+    # visually distinct from real company orgs.
+    affinity_name = f"{name} (Stealth)"
     try:
         result = process_company(
-            search_term=name,
+            search_term=affinity_name,
             domain=None,
             is_missed=False,
             slack_user_id=poster_id,
@@ -1167,8 +1170,14 @@ def build_poll_blocks(seed_text, candidates, poster_id, is_missed, linkedin_url=
 
     blocks.append({"type": "divider"})
 
-    # Bottom row: Write in URL + Stealth
-    reply_value = json.dumps({"poster_id": poster_id})[:1900]
+    # Bottom row: Write in URL + Stealth — both buttons carry the full context
+    # so the modal (for Write in URL) and the stealth handler have what they need.
+    reply_value = json.dumps({
+        "poster_id": poster_id,
+        "is_missed": is_missed,
+        "seed": seed_text,
+        "linkedin_url": linkedin_url,
+    })[:1900]
     stealth_value = json.dumps({
         "poster_id": poster_id,
         "is_missed": is_missed,
@@ -1304,7 +1313,12 @@ def post_url_poll(client, channel, thread_ts, poster_id, seed_text, is_missed, l
         """Post a no-match fallback with Write-in-URL + Stealth buttons so the
         poster can resolve with one click — especially useful when a LinkedIn
         URL is present and we want to stash it as a Stealth note."""
-        reply_value = json.dumps({"poster_id": poster_id})[:1900]
+        reply_value = json.dumps({
+            "poster_id": poster_id,
+            "is_missed": is_missed,
+            "seed": display_name,
+            "linkedin_url": linkedin_url,
+        })[:1900]
         stealth_value = json.dumps({
             "poster_id": poster_id,
             "is_missed": is_missed,
@@ -2066,22 +2080,136 @@ def handle_url_stealth(ack, body, client):
 
 @app.action("url_reply_later")
 def handle_url_reply_later(ack, body, client):
-    """User will reply in thread with the URL."""
+    """Open a Slack modal for the user to type the URL directly, rather than
+    asking them to post a follow-up message in-channel. Submitting the modal
+    creates the Affinity entry and replaces the original poll with the result."""
     ack()
     try:
-        clicker_id = body["user"]["id"]
+        payload = json.loads(body["actions"][0]["value"])
         channel_id = body["channel"]["id"]
         message_ts = body["message"]["ts"]
-        payload = json.loads(body["actions"][0]["value"])
-        poster_id = payload.get("poster_id")
+        trigger_id = body["trigger_id"]
 
-        resolved = (
-            f"✍️ <@{clicker_id}> will post the URL for <@{poster_id}>'s lead. "
-            f"No Affinity entry created yet — drop the URL in this channel and I'll pick it up."
-        )
-        disable_poll_message(client, channel_id, message_ts, resolved)
+        seed = payload.get("seed", "") or "this company"
+
+        # private_metadata carries state across the modal round-trip — Slack
+        # caps it at 3000 chars.
+        private_metadata = json.dumps({
+            "channel_id": channel_id,
+            "message_ts": message_ts,
+            "poster_id": payload.get("poster_id"),
+            "is_missed": payload.get("is_missed", False),
+            "seed": payload.get("seed", ""),
+            "linkedin_url": payload.get("linkedin_url"),
+        })[:2950]
+
+        view = {
+            "type": "modal",
+            "callback_id": "url_reply_later_submit",
+            "private_metadata": private_metadata,
+            "title": {"type": "plain_text", "text": "Add URL"},
+            "submit": {"type": "plain_text", "text": "Add to Affinity"},
+            "close": {"type": "plain_text", "text": "Cancel"},
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"Enter the website URL for *{seed}* and I'll add it to "
+                            f"the deal pipeline."
+                        ),
+                    },
+                },
+                {
+                    "type": "input",
+                    "block_id": "url_block",
+                    "label": {"type": "plain_text", "text": "Website URL"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "url_input",
+                        "placeholder": {"type": "plain_text", "text": "https://example.com"},
+                    },
+                },
+                {
+                    "type": "input",
+                    "block_id": "name_block",
+                    "label": {"type": "plain_text", "text": "Company name (optional — defaults to the seed)"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "name_input",
+                        "initial_value": payload.get("seed", "") or "",
+                    },
+                    "optional": True,
+                },
+            ],
+        }
+        client.views_open(trigger_id=trigger_id, view=view)
     except Exception as e:
         logger.error(f"Error in url_reply_later handler: {e}")
+
+
+@app.view("url_reply_later_submit")
+def handle_url_reply_later_submit(ack, body, client):
+    """Process the URL submitted through the modal. Creates/updates the
+    Affinity org and replaces the original poll message with the result."""
+    try:
+        values = body["view"]["state"]["values"]
+        url_raw = (values["url_block"]["url_input"].get("value") or "").strip()
+        name = (values["name_block"]["name_input"].get("value") or "").strip()
+
+        # Auto-prepend https:// if missing; validate very loosely.
+        url = url_raw
+        if url and not re.match(r"^https?://", url, re.IGNORECASE):
+            url = f"https://{url}"
+        if not url or not re.match(r"^https?://[^\s]+\.[^\s]+", url, re.IGNORECASE):
+            # Return an error and keep the modal open so the user can fix.
+            ack(response_action="errors", errors={"url_block": "Please enter a valid URL (e.g., https://example.com)."})
+            return
+
+        ack()
+
+        clicker_id = body["user"]["id"]
+        meta = json.loads(body["view"]["private_metadata"])
+        channel_id = meta["channel_id"]
+        message_ts = meta["message_ts"]
+        poster_id = meta.get("poster_id")
+        is_missed = meta.get("is_missed", False)
+        seed = meta.get("seed", "")
+        linkedin_url = meta.get("linkedin_url")
+
+        m = re.search(r"https?://(?:www\.)?([^/]+)", url)
+        domain = m.group(1) if m else url
+        company_name = name or seed or domain.split(".")[0].title()
+
+        note = None
+        if linkedin_url:
+            note = (
+                f"LinkedIn: {linkedin_url} (shared by <@{poster_id}>, "
+                f"URL provided by <@{clicker_id}> via dealflow-bot)"
+            )
+
+        result = process_company(
+            search_term=company_name,
+            domain=domain,
+            is_missed=is_missed,
+            slack_user_id=poster_id,
+            note=note,
+        )
+
+        resolved = (
+            f"✍️ <@{clicker_id}> provided *{domain}* for <@{poster_id}>'s lead.\n"
+            f"{result['message']}"
+        )
+        if linkedin_url:
+            resolved += f"\n🔗 LinkedIn URL saved as a note on the org."
+        disable_poll_message(client, channel_id, message_ts, resolved)
+    except Exception as e:
+        logger.error(f"Error in url_reply_later_submit handler: {e}")
+        try:
+            ack()
+        except Exception:
+            pass
 
 
 @app.event("app_mention")
