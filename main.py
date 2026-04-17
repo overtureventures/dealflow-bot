@@ -14,6 +14,11 @@ import pytz
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Version marker — bumps with each code change so Railway logs prove which
+# build is running. Grep Railway logs for "[VERSION]" to see the line below.
+BOT_VERSION = "2026-04-16-extellis-v2 (seedtable+vctavern blocked, funding-slug penalty, smarter guess trigger)"
+logger.info(f"[VERSION] {BOT_VERSION}")
+
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
 AFFINITY_API_KEY = os.environ.get("AFFINITY_API_KEY")
