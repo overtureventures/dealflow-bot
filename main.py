@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # Version marker — bumps with each code change so Railway logs prove which
 # build is running. Grep Railway logs for "[VERSION]" to see the line below.
-BOT_VERSION = "2026-04-16-extellis-v3 (auto-promote homepage roots, VC-firm page penalty)"
+BOT_VERSION = "2026-04-17T00-39-extellis-v4 (auto-promote homepage roots, VC-firm page penalty — fresh paste)"
 logger.info(f"[VERSION] {BOT_VERSION}")
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
