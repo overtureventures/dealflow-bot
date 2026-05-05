@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # Version marker — bumps with each code change so Railway logs prove which
 # build is running. Grep Railway logs for "[VERSION]" to see the line below.
-BOT_VERSION = "2026-04-17T01-00-v6 (ignore team announcements / meta-discussion in channel)"
+BOT_VERSION = "2026-05-05T00-30-v8 (only respond to messages that look like company names; ignore $ % and fundraising fragments)"
 logger.info(f"[VERSION] {BOT_VERSION}")
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
@@ -393,50 +393,134 @@ def strip_urls(text):
     return text.strip()
 
 
-# Patterns that mark a message as a team announcement or in-channel discussion
-# rather than a company submission. Any one match → the bot silently ignores.
-_ANNOUNCEMENT_STARTER_RE = re.compile(
-    r"^\s*(?:team[,:\s\-]|hey\s+team|hi\s+team|folks\b|hey\s+folks|fyi\b|heads?\s+up\b|"
-    r"quick\s+note|quick\s+update|reminder[,:]?\s|pro\s+tip|update[,:])",
-    re.IGNORECASE,
-)
+# ============================================================================
+# Company-name detection — replaces the old _is_team_announcement filter.
+#
+# The bot now defaults to IGNORING messages and only triggers the URL-search
+# poll when the message clearly looks like a bare company name. Anything else
+# (questions, comments, announcements, lists, chatter) is silently skipped.
+# ============================================================================
 
-# Newline followed by a list marker: "1.", "1)", "- ", "* "
-_LIST_MARKER_RE = re.compile(r"\n\s*(?:\d+[\.\)]|[-*])\s+")
+# Words that almost never start a company name and strongly suggest the
+# message is conversational, a question, an announcement, or commentary.
+# Lowercased, matched against the first word of the message.
+_NON_COMPANY_FIRST_WORDS = {
+    # Questions / wh-words
+    "what", "when", "where", "why", "who", "whom", "whose", "which", "how",
+    # Conversational openers
+    "hi", "hey", "hello", "yo", "sup", "thanks", "thank", "thx", "ty",
+    "ok", "okay", "cool", "nice", "great", "awesome", "lol", "haha", "lmao",
+    "yes", "yeah", "yep", "no", "nope", "nah", "sure", "maybe",
+    # Team announcements / meta
+    "team", "folks", "everyone", "all", "fyi", "heads", "reminder", "update",
+    "btw", "pro", "quick", "note", "ps",
+    # Verbs / sentence starters that aren't company names
+    "i", "im", "i'm", "ive", "i've", "we", "we're", "were", "weve", "we've",
+    "you", "you're", "youre", "they", "they're", "theyre", "this", "that",
+    "these", "those", "it", "its", "it's", "there", "here", "now", "today",
+    # Question/command verbs
+    "can", "could", "should", "would", "will", "do", "does", "did", "is",
+    "are", "was", "were", "have", "has", "had", "may", "might", "must",
+    # Discussion markers
+    "see", "check", "checking", "look", "looking", "lets", "let's", "please",
+    "pls", "anyone", "anybody", "someone", "something", "trying", "want",
+    "need", "got", "just", "also", "still", "actually", "honestly", "tbh",
+    # Reaction words
+    "wow", "oh", "ah", "ugh", "hmm", "huh", "sounds", "looks", "seems",
+    # Bot meta
+    "bot",
+    # Fundraising / status fragments — these often appear as the first word
+    # of a comment about a company, not as company names themselves.
+    "raising", "raised", "raise", "rasiing",  # common typo of "raising"
+    "closing", "closed", "close", "fundraising", "funded", "funding",
+    "seeking", "seed", "preseed", "pre-seed", "series",
+    "valued", "valuation", "round", "led", "leading",
+    "sorry", "apologies", "apologize",
+}
 
-# Meta references to the bot itself or directive "see above/below" phrases
-_META_REF_RE = re.compile(
-    r"\b(?:this\s+bot|the\s+bot|this\s+app|the\s+(?:affinity\s+)?dealflow\s+bot|"
-    r"made\s+(?:some\s+)?improvements?|see\s+(?:examples?\s+)?(?:above|below))\b",
-    re.IGNORECASE,
-)
+# Punctuation that signals a sentence/comment rather than a bare company name.
+# A "?" or "!" anywhere in a short message means it's a question or exclamation,
+# not a company. (Periods are allowed because of "Inc.")
+_SENTENCE_PUNCTUATION_RE = re.compile(r"[?!]")
+
+# Multi-line messages are almost never bare company names — they're
+# announcements, summaries, or pasted content.
+_MULTILINE_RE = re.compile(r"\n")
 
 
-def _is_team_announcement(text):
-    """Return True if the message looks like a team announcement / discussion
-    rather than a company lead. Used to silently skip bot processing.
+def _looks_like_company_name(text):
+    """Return True if the message plausibly is a bare company name worth
+    asking the bot to look up.
 
-    Signals (any one triggers ignore):
-      1. Starts with a team-direction phrase ("Team -", "Hey team", "FYI", etc.)
-         — but only if the message has 5+ words, so bare "Team Ventures" passes.
-      2. Contains a numbered or bulleted list on a new line.
-      3. Contains meta references to the bot itself or "see above/below".
+    Default behavior is to IGNORE messages — only fire when the message
+    clearly looks like a company name. Specifically:
+
+      - 1 to 4 words after stripping URLs and parenthetical asides
+      - Under 50 characters
+      - No "?" or "!" anywhere
+      - No newlines (single-line message)
+      - First word is not in the conversational/announcement stoplist
+      - Not all-lowercase filler (e.g. "what about it") — at least one
+        token starts with an uppercase letter OR the message is a single
+        token (allowing lowercase brand names like "openai")
+
+    Note: messages that already contain a URL or LinkedIn link are
+    handled BEFORE this function is called, so this only gates the
+    "no URL — run search poll" path.
     """
     if not text:
         return False
+
     stripped = text.strip()
     if not stripped:
         return False
 
-    word_count = len(stripped.split())
+    # No multi-line messages
+    if _MULTILINE_RE.search(stripped):
+        return False
 
-    if word_count >= 5 and _ANNOUNCEMENT_STARTER_RE.search(stripped):
-        return True
-    if _LIST_MARKER_RE.search(stripped):
-        return True
-    if _META_REF_RE.search(stripped):
-        return True
-    return False
+    # No questions or exclamations
+    if _SENTENCE_PUNCTUATION_RE.search(stripped):
+        return False
+
+    # Reject messages with financial characters — these are almost always
+    # fragments describing a company (raising $4M, valued at 20%, etc.)
+    # rather than the company name itself. Company names don't contain $ or %.
+    if "$" in stripped or "%" in stripped:
+        return False
+
+    # Length cap: 50 chars is generous for a company name + suffix
+    if len(stripped) > 50:
+        return False
+
+    # Strip parenthetical asides like "(seed stage)" before counting words
+    cleaned = re.sub(r"\([^)]*\)", "", stripped).strip()
+    if not cleaned:
+        return False
+
+    # Must contain at least one ASCII letter — filters out pure emoji,
+    # numbers, or punctuation messages
+    if not re.search(r"[a-zA-Z]", cleaned):
+        return False
+
+    tokens = cleaned.split()
+    if len(tokens) < 1 or len(tokens) > 4:
+        return False
+
+    # First-word stoplist check (case-insensitive, strip trailing punctuation)
+    first = re.sub(r"[^a-zA-Z']", "", tokens[0]).lower()
+    if first in _NON_COMPANY_FIRST_WORDS:
+        return False
+
+    # Capitalization heuristic: if it's 2+ tokens AND every token is
+    # all-lowercase, it's probably a fragment of conversation, not a name.
+    # Single-token messages skip this check (so "openai" works).
+    if len(tokens) > 1:
+        any_capitalized = any(t[:1].isupper() for t in tokens if t)
+        if not any_capitalized:
+            return False
+
+    return True
 
 
 def clean_seed_text(text):
@@ -1929,13 +2013,6 @@ def handle_message(event, say, client):
     if not text:
         return
 
-    # Skip team announcements, in-channel discussion, meta-references to the bot.
-    # These aren't company leads — e.g., "Team - made some improvements to this bot",
-    # "FYI, here are the changes", "See examples above", numbered/bulleted lists.
-    if _is_team_announcement(text):
-        logger.info(f"Ignoring team announcement/discussion: {text[:80]}...")
-        return
-
     user_id = event.get("user")
 
     # Check if this is a "missed" deal BEFORE branching
@@ -2007,13 +2084,19 @@ def handle_message(event, say, client):
         )
         return
 
-    # --- Branch 2: no URL — run search + poll flow ---
+    # --- Branch 2: no URL — only proceed if the message clearly looks like a
+    # bare company name. Anything else (questions, comments, announcements,
+    # lists, chatter) is silently ignored.
+    if not _looks_like_company_name(text):
+        logger.info(f"Ignoring non-company-name message: {text[:80]}...")
+        return
+
     seed = clean_seed_text(text)
     if len(seed) < MIN_POLL_MESSAGE_LENGTH:
         # Too short / probably a greeting — ignore
         return
 
-    logger.info(f"No URL detected — launching URL search poll for seed='{seed}' (is_missed: {is_missed})")
+    logger.info(f"Looks like a company name — launching URL search poll for seed='{seed}' (is_missed: {is_missed})")
 
     # Post the poll in-thread under the original message
     post_url_poll(
